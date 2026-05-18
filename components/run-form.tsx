@@ -118,8 +118,13 @@ export function RunForm({
           onChange={(e) => setVolume(e.target.value)}
         />
         <p className="text-xs text-muted-foreground">
-          Total rows across all tables. The default run is ~500 rows; 2000
-          exercises the cache delta path.
+          Total rows across all tables, distributed proportionally by
+          scenario coverage. Generation runs <strong>chunked, one table at
+          a time in FK-topological order</strong> — primary keys are
+          pre-allocated deterministically and foreign keys must pick from
+          known parent IDs, so FK violations are impossible. 200–500 is
+          typical; up to {HARD_CAPS.maxRows.toLocaleString()} works for
+          dense schemas.
         </p>
         {state.errors?.volume ? (
           <p role="alert" className="text-xs text-destructive">

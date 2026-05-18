@@ -77,7 +77,7 @@ export async function submitRunAction(
     productContext: context,
     requestedVolume: volume,
   });
-  redirect(`/runs/${wfRun.runId}/confirm`);
+  redirect(`/runs/${wfRun.runId}`);
 }
 
 export async function confirmRunAction(runId: string): Promise<void> {
@@ -117,5 +117,5 @@ export async function rerunWithVolumeAction(
     productContext: prev!.productContext,
     requestedVolume: safeVolume,
   });
-  redirect(`/runs/${wfRun.runId}/confirm`);
+  redirect(`/runs/${wfRun.runId}`);
 }

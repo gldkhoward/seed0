@@ -48,6 +48,13 @@ export interface RunStep {
   startedAt?: string;
   finishedAt?: string;
   note?: string;
+  /**
+   * Step-specific output payload, set by the workflow as steps complete.
+   * Schema is loose (JSON) so steps can evolve their output without a
+   * type migration; the run-progress UI has a per-step renderer that
+   * knows the shape it expects for each StepName.
+   */
+  details?: Record<string, unknown>;
 }
 
 export interface RunSummary {

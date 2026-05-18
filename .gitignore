@@ -36,6 +36,10 @@ yarn-error.log*
 # vercel
 .vercel
 
+# seed0 run exports downloaded via the /export route
+wrun_*.json
+wrun_*.sql
+
 # typescript
 *.tsbuildinfo
 next-env.d.ts

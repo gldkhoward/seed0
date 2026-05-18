@@ -20,7 +20,7 @@
  * idempotent under `allowOverwrite: true`.
  */
 
-import { list, put } from "@vercel/blob";
+import { get, list, put } from "@vercel/blob";
 
 import {
   ECOMMERCE_CONTEXT,
@@ -95,12 +95,16 @@ function datasetPath(id: string): string {
 
 async function readJson<T>(pathname: string): Promise<T | undefined> {
   assertBlobToken();
-  const { blobs } = await list({ prefix: pathname, limit: 1 });
-  const blob = blobs.find((b) => b.pathname === pathname);
-  if (!blob) return undefined;
-  const res = await fetch(blob.url, { cache: "no-store" });
-  if (!res.ok) return undefined;
-  return (await res.json()) as T;
+  // `get(pathname, { access: "private" })` is the purpose-built read path
+  // for private blobs — it handles auth via BLOB_READ_WRITE_TOKEN. Plain
+  // `fetch(url)` against the URLs returned by `list()` is flaky for
+  // private stores because those signed URLs are short-lived.
+  // `useCache: false` bypasses the CDN cache so step-transition writes
+  // are visible to the next read immediately.
+  const result = await get(pathname, { access: "private", useCache: false });
+  if (!result || result.statusCode !== 200) return undefined;
+  const text = await new Response(result.stream).text();
+  return JSON.parse(text) as T;
 }
 
 async function writeJson(pathname: string, value: unknown): Promise<void> {
@@ -166,12 +170,14 @@ export function setRunStep(
   step: StepName,
   status: StepStatus,
   note?: string,
+  details?: Record<string, unknown>,
 ): Promise<void> {
   return mutateRecord(runId, (r) => {
     r.steps = r.steps.map((s) => {
       if (s.name !== step) return s;
       const next: RunStep = { ...s, status };
       if (note) next.note = note;
+      if (details) next.details = { ...(s.details ?? {}), ...details };
       if (status === "running" && !next.startedAt) next.startedAt = nowIso();
       if (
         status === "succeeded" ||
@@ -182,6 +188,18 @@ export function setRunStep(
       }
       return next;
     });
+  });
+}
+
+export function setRunStepDetails(
+  runId: string,
+  step: StepName,
+  details: Record<string, unknown>,
+): Promise<void> {
+  return mutateRecord(runId, (r) => {
+    r.steps = r.steps.map((s) =>
+      s.name === step ? { ...s, details: { ...(s.details ?? {}), ...details } } : s,
+    );
   });
 }
 
@@ -244,9 +262,7 @@ export async function listRuns(): Promise<RunSummary[]> {
   const records = await Promise.all(
     recordBlobs.map(async (b) => {
       try {
-        const res = await fetch(b.url, { cache: "no-store" });
-        if (!res.ok) return undefined;
-        return (await res.json()) as RunDetail;
+        return await readJson<RunDetail>(b.pathname);
       } catch {
         return undefined;
       }

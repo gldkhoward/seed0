@@ -1,3 +1,4 @@
+import { CircleAlert, TriangleAlert } from "lucide-react";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 
@@ -6,7 +7,7 @@ import { TopNav } from "@/components/top-nav";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { getRun } from "@/lib/run-store";
-import type { RunStatus } from "@/lib/ui-types";
+import type { RunDetail, RunStatus } from "@/lib/ui-types";
 
 interface RunPageProps {
   params: Promise<{ id: string }>;
@@ -63,6 +64,8 @@ export default async function RunPage({ params }: RunPageProps) {
           </p>
         </div>
 
+        <OutcomeBanner run={run} />
+
         <RunProgress run={run} />
 
         {done ? (
@@ -84,4 +87,64 @@ export default async function RunPage({ params }: RunPageProps) {
       </main>
     </div>
   );
+}
+
+function OutcomeBanner({ run }: { run: RunDetail }) {
+  if (run.status === "failed") {
+    const failedStep = run.steps.find((s) => s.status === "failed");
+    const error = failedStep?.details?.error ?? failedStep?.note;
+    return (
+      <div className="flex items-start gap-3 rounded-md border border-destructive/40 bg-destructive/5 px-4 py-3">
+        <CircleAlert
+          className="mt-0.5 size-5 shrink-0 text-destructive"
+          aria-hidden
+        />
+        <div className="flex flex-col gap-1">
+          <p className="text-sm font-medium text-destructive">
+            Run failed at {failedStep ? failedStep.name : "an unknown step"}
+          </p>
+          {error ? (
+            <p className="font-mono text-[11px] text-destructive/80">
+              {String(error)}
+            </p>
+          ) : null}
+          <p className="text-xs text-muted-foreground">
+            Expand the failed step below to see the full error. To retry,
+            start a new run with the same inputs from the history view.
+          </p>
+        </div>
+      </div>
+    );
+  }
+  if (run.status === "partial") {
+    const passRate =
+      run.constraintPassRate !== undefined
+        ? `${Math.round(run.constraintPassRate * 100)}%`
+        : "—";
+    const coverage =
+      run.scenariosInstantiated !== undefined &&
+      run.scenariosPlanned !== undefined
+        ? `${run.scenariosInstantiated}/${run.scenariosPlanned}`
+        : "—";
+    return (
+      <div className="flex items-start gap-3 rounded-md border border-yellow-500/40 bg-yellow-500/5 px-4 py-3">
+        <TriangleAlert
+          className="mt-0.5 size-5 shrink-0 text-yellow-500"
+          aria-hidden
+        />
+        <div className="flex flex-col gap-1">
+          <p className="text-sm font-medium">Run completed — partial</p>
+          <p className="text-xs text-muted-foreground">
+            Constraint pass rate{" "}
+            <span className="font-mono text-foreground">{passRate}</span>,
+            predicate coverage{" "}
+            <span className="font-mono text-foreground">{coverage}</span>.
+            Expand the validate / evaluate steps below to see what missed,
+            or open the readiness report for the full breakdown.
+          </p>
+        </div>
+      </div>
+    );
+  }
+  return null;
 }
