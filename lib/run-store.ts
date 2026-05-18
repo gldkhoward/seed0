@@ -54,7 +54,7 @@ function assertBlobToken(): void {
 }
 
 const PUT_OPTIONS = {
-  access: "public" as const,
+  access: "private" as const,
   addRandomSuffix: false,
   allowOverwrite: true,
   contentType: "application/json",

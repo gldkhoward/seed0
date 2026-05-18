@@ -223,9 +223,12 @@ each `record.json` stays fast. The export route and report view fetch
 `dataset.json` separately; the progress page skips that read entirely.
 No `runs/index.json` aggregate — it would serialize all writes through
 one key and create a cross-run concurrency landmine. Blobs are written
-with `addRandomSuffix: false, allowOverwrite: true,
-cacheControlMaxAge: 0` so pathnames are stable and reads are not CDN-
-cached.
+with `access: "private", addRandomSuffix: false, allowOverwrite: true,
+cacheControlMaxAge: 0` so pathnames are stable, the store is not
+publicly browsable (run records contain user-supplied schemas and
+product context), and reads are not CDN-cached. The signed URLs
+returned by `put`/`list` remain fetchable from server code, which is
+the only consumer.
 
 ## D16: Flush record.json on every state transition
 
