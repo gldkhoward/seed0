@@ -196,11 +196,11 @@ export function ReadinessReport({ run, plan, report }: ReadinessReportProps) {
       <Card>
         <CardHeader>
           <CardTitle className="text-base font-semibold">
-            Export canonical dataset
+            Export the dataset
           </CardTitle>
           <CardDescription>
-            JSON is the source of truth; the SQL export is derived from the
-            JSON, dependency-ordered, never produced by the model.
+            JSON is the source of truth. The SQL export is derived from it,
+            dependency-ordered, and ready to load into a Postgres database.
           </CardDescription>
         </CardHeader>
         <CardContent className="flex flex-wrap items-center gap-2">

@@ -13,40 +13,67 @@ predicates, and scores. The model is never the trust boundary.
 
 ## How it works
 
-```
-Postgres DDL                AI SDK (planner)            User confirms plan
-   │                              │                            │
-   ▼                              ▼                            ▼
-Parse ─► EntityModel ─► Plan ─► Predicates ─► Cost estimate ─► (hook)
-                                                                 │
-                                                                 ▼
-                AI SDK (generator) ─► Shape validator ─► Constraint validator
-                                                                 │
-                                       ┌─────────────────────────┴─┐
-                                       │ failures? bounded repair  │
-                                       └─────────────────────────┬─┘
-                                                                 ▼
-                                                 Canonical dataset (D10)
-                                                                 │
-                          Predicate evaluator ◄──────────────────┤
-                                       │                         │
-                                       ▼                         ▼
-                              Readiness score          Persist to Blob
-```
+**Three-layer composition.** A deterministic [Vercel Workflow](https://vercel.com/docs/workflow)
+orchestrates the run end-to-end — step order, fan-out, validation, scoring, and
+persistence are procedural code. Two scoped LLM tool-call loops sit inside
+named steps: an **architect** that designs the execution plan and decides cache
+reuse (hard cap: 8 tool-call steps), and a **repair agent** that fixes
+constraint violations the deterministic validator surfaced (hard cap: 20
+tool-call steps). Each tool either reads state or mutates and re-validates
+immediately, so the agents cannot declare success — they can only propose, and
+the deterministic validator decides. Generation, schema parsing, predicate
+evaluation, scoring, and persistence are pure deterministic code. The agents
+do not delegate to each other and have no nested planning; both are invoked
+exactly once per run.
 
-The whole run is a [Vercel Workflow](https://vercel.com/docs/workflow) with
-named steps so failures resume at the right place. Two — and only two — loops
-are automatically retried: the generation step on malformed structured output,
-and the validate/repair loop on constraint violations. Both caps are explicit.
+### Pipeline
+
+parse → schema-hash → architect (plan + cache-decision) → confirm-pause
+(human-in-the-loop) → optional cache-rehydrate → chunked parallel generate
+→ deterministic validate → repair agent → predicate-evaluate → optional
+coverage-boost → score → persist.
+
+`predicate-evaluate` (`lib/predicate-eval.ts`) is the deterministic
+verification point: a scenario counts as covered only when at least one
+generated row mechanically satisfies its predicate — the model never scores
+its own coverage. The cache decision and coverage-boost are both observable
+workflow steps.
+
+Step-level automatic retry is deliberately conservative: only the architect
+(max 2) and the cache read (max 1) retry. Generation and repair don't,
+because each has its own bounded internal loop — sub-chunk halve-on-parse-
+fail in the chunked generator, the tool-call step cap in the repair agent —
+that streams progress to the UI incrementally instead.
+
+### Evaluation
+
+`pnpm eval` runs a regression against the 8-table ecommerce fixture and
+asserts ≥100% constraint pass and ≥100% predicate coverage, exiting non-zero
+otherwise. It currently exercises the simpler single-call generator path
+(`lib/generator.ts`) as a deterministic floor on structured-output quality —
+the shipping workflow's architect / chunked-generator / repair-agent loop is
+exercised by the demo runs themselves, not by the eval.
 
 ## Stack
 
 - **Framework**: Next.js 16 App Router, React 19, TypeScript, Tailwind v4
 - **UI**: shadcn/ui (new-york, Radix base, zinc neutrals, green primary), Geist Sans + Mono
-- **AI**: AI SDK v6 via Vercel AI Gateway (`provider/model` strings, no per-provider SDKs)
-- **Orchestration**: Vercel Workflow with named steps and a human-confirm hook
-- **Persistence**: Vercel Blob (single store; `runs/{id}/record.json` + `dataset.json`)
-- **Schema parsing**: `pgsql-ast-parser` for an AST-driven Postgres DDL subset
+- **AI**: AI SDK v6 (`ai@^6`) via Vercel AI Gateway — one key, no provider SDK.
+  Two-stage model split: Sonnet (`anthropic/claude-sonnet-4-6`) for judgment
+  (architect, repair); Haiku (`anthropic/claude-haiku-4-5`) for bulk slot-
+  filling in the chunked generator. The expensive model only does judgment.
+- **Orchestration**: Vercel Workflow with named steps and a human-confirm
+  hook. Long-running and streaming workloads run on Vercel Fluid Compute (the
+  platform default), which keeps the events-stream connection open for the
+  duration of a run.
+- **Streaming**: the workflow's NDJSON stream is piped straight to the browser
+  via `app/runs/[id]/events/route.ts`, resumable with `?startIndex=N`. A
+  namespaced `agent:thoughts` stream carries live tool-call narration. No
+  client polling.
+- **Persistence**: Vercel Blob (single store; `runs/{id}/record.json` +
+  `runs/{id}/dataset.json`; content-addressed dataset cache under
+  `cache/<schemaHash>/<runId>.json`).
+- **Schema parsing**: `pgsql-ast-parser` for an AST-driven Postgres DDL subset.
 
 ## Local setup
 
@@ -94,27 +121,39 @@ app/                    Next App Router routes
   page.tsx              Landing (force-static)
   new/                  Run creation form
   runs/                 History + per-run views (progress, confirm, report, export)
-components/             View-only React (shadcn primitives only; no raw <div>/<button>)
+components/             View-only React (shadcn primitives only)
+workflows/run.ts        Vercel Workflow definition with named steps
+scripts/run-eval.ts     CLI entrypoint for `pnpm eval`
 lib/
-  ai.ts                 AI SDK wrapper (structuredOutput via generateObject)
+  # AI / generation (the LLM-touching code)
+  ai.ts                 AI SDK wrapper (generateObject for structured output)
+  architect-agent.ts    Plan + cache-decision LLM tool-call loop (cap 8 steps)
+  chunked-generator.ts  Parallel, FK-aware generator (pre-allocated PKs + uniques)
+  repair-agent.ts       Repair LLM tool-call loop (cap ~20; re-validates per tool)
+  repair-deterministic.ts  Pure-code repair strategies the agent dispatches to
+  coverage-boost.ts     Optional regeneration for uninstantiated scenarios
+  generator.ts          Legacy single-call generator — kept as the eval baseline
+  planner.ts            Legacy scenarios-only planner — architect fallback path
+
+  # Deterministic core (LLM-free)
   parser.ts             DDL → EntityModel; rejects unsupported constructs
-  planner.ts            Scenario planner; predicates bound to entity model
-  generator.ts          Seed generator with shape-retry + repair-retry caps
-  shape-validate.ts     Structural shape validator (gates generation-step retry)
+  shape-validate.ts     Structural shape validator
   validate.ts           Constraint validator (FK, enum, check, unique, type)
   canonical.ts          Canonical dataset assembly (deterministic, topological)
   canonical-export.ts   JSON + Postgres-SQL export derived from canonical form
-  predicate-eval.ts     Deterministic predicate evaluator (D11)
+  predicate-eval.ts     Deterministic predicate evaluator — the verification point
   score.ts              Decomposed readiness score (predicate + constraint)
-  pipeline.ts           Assembles modules behind the Pipeline interface
+  pipeline.ts           Pipeline interface used by the eval (talks to generator.ts)
+
+  # Plumbing
   run-store.ts          Vercel Blob-backed run record + dataset persistence
+  run-cache.ts          Content-addressed dataset cache (Vercel Blob)
+  run-stream.ts         Live progress + agent-thoughts stream publishers
   ui-actions.ts         Server actions (submit, confirm, cancel, re-run)
   ui-types.ts           View-model types + HARD_CAPS + cost estimate
-  fixtures/             Ecommerce demo fixture (DDL, context, plan)
+  fixtures/             Ecommerce fixture (eval'd) + 7 example schemas
   eval/regression.ts    Track B regression check (used by `pnpm eval`)
-workflows/run.ts        Vercel Workflow definition with named steps
-scripts/run-eval.ts     CLI entrypoint for `pnpm eval`
-openspec/               Spec, design decisions, and task checklist
+openspec/               Historical spec — superseded; kept for traceability
 ```
 
 ## Constraints (binding)

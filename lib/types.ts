@@ -101,6 +101,57 @@ export type ScenarioPlan = {
 };
 
 /**
+ * Architect-produced execution plan. Emitted alongside `ScenarioPlan` by
+ * the architect agent (lib/architect-agent.ts). The workflow consumes
+ * this to decide parallelism, optional steps, and cache reuse.
+ *
+ * - `parallelGroups`: ordered waves. Each wave runs concurrently;
+ *   waves run sequentially. Names must reference tables in the
+ *   EntityModel. The validator rejects plans that violate FK ordering.
+ * - `tableAllocations`: per-table row counts. Sum should be ≈ the
+ *   requested volume. The agent decides distribution, weighting
+ *   scenario-heavy tables.
+ * - `optionalSteps`: opt-in steps that run only if the architect
+ *   enabled them. Today: `coverage-boost`.
+ * - `cacheDecision`: agent's reuse vs regenerate decision.
+ */
+export type ExecutionPlan = {
+  parallelGroups: readonly (readonly string[])[];
+  tableAllocations: Readonly<Record<string, number>>;
+  optionalSteps: readonly OptionalStepKind[];
+  cacheDecision: CacheDecision;
+  reasoning: string;
+};
+
+export type OptionalStepKind = "coverage-boost";
+
+export type CacheDecision =
+  | { kind: "reuse"; sourceRunId: string; reason: string }
+  | { kind: "regenerate"; reason: string };
+
+/**
+ * Architect output: the existing ScenarioPlan plus the ExecutionPlan.
+ */
+export type ArchitectPlan = {
+  scenarios: readonly Scenario[];
+  execution: ExecutionPlan;
+};
+
+/**
+ * Lightweight live narration emitted by agents (architect + repair) on
+ * the `agent:thoughts` namespaced workflow stream. Consumed by the UI
+ * to render a side panel beside the step timeline.
+ */
+export type AgentThought = {
+  agent: "architect" | "repair";
+  at: string;
+  kind: "tool-call" | "decision" | "status";
+  toolName?: string;
+  message: string;
+  data?: Record<string, unknown>;
+};
+
+/**
  * Canonical dataset (D10): JSON keyed by table, deterministic value
  * serialization, tables ordered topologically by FK dependency.
  */

@@ -7,6 +7,7 @@
  */
 
 import type {
+  ExecutionPlan,
   PredicateExpr,
   ScalarLiteral,
   ScenarioPlan,
@@ -32,6 +33,7 @@ export type StepName =
   | "validate"
   | "repair"
   | "predicate-evaluate"
+  | "coverage-boost"
   | "score"
   | "persist";
 
@@ -74,6 +76,10 @@ export interface RunDetail extends RunSummary {
   productContext: string;
   steps: RunStep[];
   plan?: ScenarioPlan;
+  /** Architect-authored execution plan (parallel groups, optional steps, cache decision). */
+  executionPlan?: ExecutionPlan;
+  /** Schema content hash used as the cache key. */
+  schemaHash?: string;
   report?: ReadinessReport;
   cancellation?: { reason: string };
   canonicalDataset?: CanonicalDataset;

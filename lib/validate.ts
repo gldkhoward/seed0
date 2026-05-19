@@ -62,6 +62,14 @@ export function validateDataset(
     const rows = dataset.tables[table.name] ?? [];
     totalRecords += rows.length;
 
+    // Composite primary keys make the TUPLE unique — not the individual
+    // columns. The parser flags every member of a composite PK with
+    // `col.primaryKey = true`, so we have to look at how many PK columns
+    // the table has before registering single-column unique indexes.
+    const compositePk =
+      (table.primaryKey ?? []).length > 1 ||
+      table.columns.filter((c) => c.primaryKey).length > 1;
+
     const uniqueIndex = new Map<string, Set<string>>();
     for (const u of table.uniqueConstraints ?? []) {
       uniqueIndex.set(uniqueKey(u.columns), new Set());
@@ -70,12 +78,18 @@ export function validateDataset(
       if (col.unique && !col.primaryKey) {
         uniqueIndex.set(uniqueKey([col.name]), new Set());
       }
-      if (col.primaryKey) {
+      if (col.primaryKey && !compositePk) {
         uniqueIndex.set(uniqueKey([col.name]), new Set());
       }
     }
-    if (table.primaryKey && table.primaryKey.length > 1) {
-      uniqueIndex.set(uniqueKey(table.primaryKey), new Set());
+    if (compositePk) {
+      const pkCols =
+        table.primaryKey && table.primaryKey.length > 0
+          ? table.primaryKey
+          : table.columns.filter((c) => c.primaryKey).map((c) => c.name);
+      if (pkCols.length > 1) {
+        uniqueIndex.set(uniqueKey(pkCols), new Set());
+      }
     }
 
     rows.forEach((row, i) => {

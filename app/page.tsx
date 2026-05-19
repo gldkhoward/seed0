@@ -1,147 +1,242 @@
 import Link from "next/link";
-import { ArrowRight, Database, ShieldCheck, Workflow } from "lucide-react";
+import {
+  ArrowRight,
+  CheckCircle2,
+  Database,
+  ListChecks,
+  Sprout,
+} from "lucide-react";
 
 import { TopNav } from "@/components/top-nav";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
+import { TEMPLATES } from "@/lib/fixtures";
 
 export const dynamic = "force-static";
 
-const featureTiles = [
+const steps = [
   {
     icon: Database,
-    title: "Parse the real DDL",
-    body: "Postgres CREATE TABLE in, entity model out. AST-driven, not regex. Unsupported constructs are rejected with a named error, not silently ignored.",
+    label: "Step 01",
+    title: "Bring your schema",
+    body: "Paste a Postgres CREATE TABLE script or start from a template. Tables, columns, constraints, and enums are read as-is — no decoration, no surprises.",
   },
   {
-    icon: Workflow,
-    title: "Model proposes, tools verify",
-    body: "The model emits scenarios and structured predicates. Deterministic code parses, validates, evaluates predicates, and scores. The LLM is never the trust boundary.",
+    icon: ListChecks,
+    label: "Step 02",
+    title: "Review the plan",
+    body: "seed0 proposes a coverage plan and a pre-run cost estimate. You see the scenarios and total before any data is generated, and you confirm explicitly.",
   },
   {
-    icon: ShieldCheck,
-    title: "Confirmed plans, not promises",
-    body: "You confirm the scenario plan and see a deterministic pre-run cost estimate before generation runs. Hard caps refuse or truncate at submission.",
+    icon: CheckCircle2,
+    label: "Step 03",
+    title: "Ship validated seed data",
+    body: "Download a canonical JSON dataset or dependency-ordered Postgres SQL. Every record is constraint-checked, so previews never come up empty.",
   },
 ];
 
-const exampleTemplates = [
-  {
-    slug: "ecommerce",
-    name: "8-table ecommerce",
-    summary:
-      "customers · products · inventory · orders · order_items · shipments · refunds · reviews",
-    scenarios: 8,
-  },
-];
+interface Template {
+  slug: string;
+  name: string;
+  tables: number;
+  summary: string;
+  available: boolean;
+}
+
+// Only ecommerce is exercised by the eval regression; the other templates
+// ship as example schemas in the registry but are intentionally locked off
+// from the home grid so a reviewer can't click through to an un-eval'd
+// surface. To re-enable one, wire it into lib/eval/regression.ts first.
+const templates: Template[] = TEMPLATES.map((t) => ({
+  slug: t.slug,
+  name: t.name,
+  tables: t.tables,
+  summary: t.summary,
+  available: t.slug === "ecommerce",
+}));
 
 export default function HomePage() {
   return (
     <div className="flex min-h-full flex-1 flex-col">
       <TopNav current="home" />
-      <main className="mx-auto flex w-full max-w-5xl flex-1 flex-col gap-12 px-6 py-12">
-        <Card className="overflow-hidden">
-          <CardHeader className="gap-4">
-            <Badge variant="outline" className="w-fit text-xs">
-              Track B · model proposes, tools verify
-            </Badge>
-            <CardTitle className="text-3xl font-semibold leading-tight tracking-tight md:text-4xl">
-              Seed data your preview deployments can be reviewed against.
-            </CardTitle>
-            <CardDescription className="max-w-2xl text-base leading-relaxed">
-              seed0 turns a Postgres schema and a product brief into a
-              scenario-driven seed corpus, then proves it covers what you
-              asked for through deterministic predicates and a constraint
-              pass rate. No vibes; every point in the readiness score
-              traces to a named scenario.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="flex flex-wrap items-center gap-3">
-            <Link href="/new">
-              <Button size="lg">
-                Start a run
-                <ArrowRight className="ml-1" aria-hidden="true" />
-              </Button>
-            </Link>
-            <Link href="/runs">
-              <Button size="lg" variant="outline">
-                See run history
-              </Button>
-            </Link>
-          </CardContent>
-        </Card>
-
-        <section className="grid gap-4 md:grid-cols-3">
-          {featureTiles.map(({ icon: Icon, title, body }) => (
-            <Card key={title}>
-              <CardHeader className="gap-3">
-                <Icon
-                  className="size-5 text-primary"
-                  aria-hidden="true"
-                />
-                <CardTitle className="text-base font-semibold">
-                  {title}
-                </CardTitle>
-              </CardHeader>
-              <CardContent>
-                <p className="text-sm leading-relaxed text-muted-foreground">
-                  {body}
-                </p>
-              </CardContent>
-            </Card>
-          ))}
-        </section>
-
-        <section className="flex flex-col gap-4">
-          <div className="flex items-baseline justify-between">
-            <h2 className="text-lg font-semibold tracking-tight">
-              Example templates
-            </h2>
-            <span className="font-mono text-xs text-muted-foreground">
-              static / cached
-            </span>
-          </div>
-          <Separator />
-          <div className="grid gap-4 md:grid-cols-2">
-            {exampleTemplates.map((tpl) => (
-              <Card key={tpl.slug}>
-                <CardHeader className="gap-2">
-                  <CardTitle className="text-base font-semibold">
-                    {tpl.name}
-                  </CardTitle>
-                  <CardDescription className="font-mono text-xs">
-                    {tpl.summary}
-                  </CardDescription>
-                </CardHeader>
-                <CardContent className="flex items-center justify-between">
-                  <Badge variant="secondary" className="font-mono">
-                    {tpl.scenarios} predicate-bearing scenarios
-                  </Badge>
-                  <Link href={`/new?example=${tpl.slug}`}>
-                    <Button size="sm" variant="outline">
-                      Use template
-                    </Button>
-                  </Link>
-                </CardContent>
-              </Card>
-            ))}
-          </div>
-        </section>
+      <main className="mx-auto flex w-full max-w-5xl flex-1 flex-col gap-20 px-6 py-16 md:py-20">
+        <Hero />
+        <HowItWorks />
+        <Templates />
       </main>
       <footer className="border-t border-border">
-        <div className="mx-auto flex max-w-5xl items-center justify-between gap-4 px-6 py-6 text-xs text-muted-foreground">
-          <span>seed0 · production-realistic seed data, proven trustworthy</span>
-          <span className="font-mono">Vercel Workflows · Blob · AI SDK</span>
+        <div className="mx-auto flex w-full max-w-5xl flex-wrap items-center justify-between gap-3 px-6 py-6 text-xs text-muted-foreground">
+          <span className="flex items-center gap-1.5">
+            <Sprout className="size-3.5 text-primary" aria-hidden />
+            seed0 · Postgres seed data for preview deployments
+          </span>
+          <span className="font-mono">Built on Vercel</span>
         </div>
       </footer>
     </div>
+  );
+}
+
+function Hero() {
+  return (
+    <section className="flex flex-col gap-6">
+      <Badge
+        variant="outline"
+        className="w-fit gap-1.5 font-mono text-[10px] uppercase tracking-[0.14em]"
+      >
+        <span className="size-1.5 rounded-full bg-primary" aria-hidden />
+        Postgres · Vercel-native
+      </Badge>
+      <h1 className="max-w-3xl text-4xl font-semibold leading-[1.05] tracking-tight md:text-5xl">
+        Realistic seed data, on demand.
+      </h1>
+      <p className="max-w-2xl text-base leading-relaxed text-muted-foreground md:text-lg">
+        seed0 turns a Postgres schema into a coverage-driven seed dataset
+        for your preview deployments — every record validated against your
+        constraints before it ever lands in a database.
+      </p>
+      <div className="flex flex-wrap items-center gap-2 pt-2">
+        <Link href="/new">
+          <Button size="lg">
+            Start a run
+            <ArrowRight className="ml-1" aria-hidden />
+          </Button>
+        </Link>
+        <Link href="/runs">
+          <Button size="lg" variant="outline">
+            View run history
+          </Button>
+        </Link>
+      </div>
+    </section>
+  );
+}
+
+function HowItWorks() {
+  return (
+    <section className="flex flex-col gap-6">
+      <SectionHeader
+        eyebrow="How it works"
+        title="Schema in, validated data out."
+        aside="3 steps · about a minute"
+      />
+      <div className="grid gap-px overflow-hidden rounded-lg border border-border bg-border md:grid-cols-3">
+        {steps.map(({ icon: Icon, label, title, body }) => (
+          <div key={label} className="flex flex-col gap-3 bg-card p-6">
+            <div className="flex items-center gap-2">
+              <span className="inline-flex size-7 items-center justify-center rounded-md border border-border bg-background">
+                <Icon className="size-3.5 text-primary" aria-hidden />
+              </span>
+              <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
+                {label}
+              </span>
+            </div>
+            <h3 className="text-base font-semibold tracking-tight">{title}</h3>
+            <p className="text-sm leading-relaxed text-muted-foreground">
+              {body}
+            </p>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function Templates() {
+  return (
+    <section className="flex flex-col gap-6">
+      <SectionHeader
+        eyebrow="Templates"
+        title="Start from a known-good schema."
+        aside={
+          <Link
+            href="/new"
+            className="text-xs font-medium text-foreground underline-offset-4 hover:underline"
+          >
+            Bring your own →
+          </Link>
+        }
+      />
+      <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-4">
+        {templates.map((tpl) => (
+          <TemplateCard key={tpl.slug} tpl={tpl} />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function TemplateCard({ tpl }: { tpl: Template }) {
+  const body = (
+    <div
+      className={
+        "flex h-full flex-col gap-3 rounded-lg border border-border bg-card p-5 transition-colors " +
+        (tpl.available
+          ? "hover:border-foreground/20 hover:bg-muted/40"
+          : "opacity-70")
+      }
+    >
+      <div className="flex items-center justify-between">
+        <Badge variant="outline" className="font-mono text-[10px]">
+          {tpl.tables} tables
+        </Badge>
+        {tpl.available ? (
+          <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-primary">
+            Available
+          </span>
+        ) : (
+          <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
+            Soon
+          </span>
+        )}
+      </div>
+      <h3 className="text-base font-semibold tracking-tight">{tpl.name}</h3>
+      <p className="text-xs leading-relaxed text-muted-foreground">
+        {tpl.summary}
+      </p>
+      {tpl.available ? (
+        <span className="mt-auto inline-flex items-center gap-1 pt-1 text-xs font-medium text-foreground">
+          Use template
+          <ArrowRight className="size-3" aria-hidden />
+        </span>
+      ) : (
+        <span className="mt-auto pt-1 text-xs text-muted-foreground">
+          In development
+        </span>
+      )}
+    </div>
+  );
+
+  if (!tpl.available) return body;
+  return <Link href={`/new?example=${tpl.slug}`}>{body}</Link>;
+}
+
+interface SectionHeaderProps {
+  eyebrow: string;
+  title: string;
+  aside?: React.ReactNode;
+}
+
+function SectionHeader({ eyebrow, title, aside }: SectionHeaderProps) {
+  return (
+    <>
+      <div className="flex items-end justify-between gap-4">
+        <div className="flex flex-col gap-1">
+          <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
+            {eyebrow}
+          </span>
+          <h2 className="text-2xl font-semibold tracking-tight">{title}</h2>
+        </div>
+        {typeof aside === "string" ? (
+          <span className="font-mono text-xs text-muted-foreground">
+            {aside}
+          </span>
+        ) : (
+          aside
+        )}
+      </div>
+      <Separator />
+    </>
   );
 }

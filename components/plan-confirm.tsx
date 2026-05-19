@@ -96,11 +96,9 @@ function Header({ runId }: { runId: string }) {
       </div>
       <h1 className="text-2xl font-semibold tracking-tight">Confirm plan</h1>
       <p className="max-w-2xl text-sm leading-relaxed text-muted-foreground">
-        Each scenario carries a structured{" "}
-        <span className="font-mono text-foreground">predicate</span> the
-        deterministic evaluator will match against canonical rows after
-        generation. The plan is not free-text editable — confirm to run,
-        cancel to discard.
+        Each scenario carries a structured rule that&apos;s checked against
+        the generated rows once the run completes. Review the plan and the
+        cost — confirm to start generation, cancel to discard.
       </p>
     </div>
   );
@@ -162,7 +160,7 @@ function ScenarioList({
           Scenarios ({scenarios.length})
         </h2>
         <span className="font-mono text-[11px] uppercase tracking-wider text-muted-foreground">
-          predicate-bearing
+          coverage rules
         </span>
       </div>
       <div className="overflow-hidden rounded-md border border-border bg-card">
@@ -223,7 +221,7 @@ function CostPanel({ cost }: { cost: ReturnType<typeof estimateRunCost> }) {
           {formatUsd(cost.totalUsd)}
         </span>
         <span className="text-[11px] text-muted-foreground">
-          Deterministic arithmetic — not a predictive model.
+          Fixed cost — no surprises after the run.
         </span>
       </div>
 
@@ -348,9 +346,8 @@ export function PlanConfirmSkeleton({ runId }: { runId: string }) {
         </div>
         <h1 className="text-2xl font-semibold tracking-tight">Confirm plan</h1>
         <p className="max-w-2xl text-sm leading-relaxed text-muted-foreground">
-          The planner is producing scenarios with structured predicates for
-          your schema and context. This page auto-refreshes every 1.5s — no
-          need to reload.
+          The planner is preparing coverage scenarios for your schema. This
+          page refreshes automatically — no need to reload.
         </p>
       </div>
 

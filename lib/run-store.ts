@@ -27,8 +27,10 @@ import {
   ECOMMERCE_DDL,
   ECOMMERCE_PLAN,
 } from "@/lib/fixtures/ecommerce";
+import { tryPublishRunSnapshot } from "@/lib/run-stream";
 import type {
   CanonicalDataset,
+  ExecutionPlan,
   ReadinessReport,
   ScalarLiteral,
   ScenarioEvaluation,
@@ -70,6 +72,7 @@ const STEP_ORDER: StepName[] = [
   "validate",
   "repair",
   "predicate-evaluate",
+  "coverage-boost",
   "score",
   "persist",
 ];
@@ -128,6 +131,7 @@ async function mutateRecord(
   if (!record) return;
   fn(record);
   await writeRecord(record);
+  await tryPublishRunSnapshot(record);
 }
 
 // -------------------- Writers (workflow + actions) --------------------
@@ -157,6 +161,7 @@ export async function ensureRunRecord(
     steps: makeSteps(false),
   };
   await writeRecord(record);
+  await tryPublishRunSnapshot(record);
 }
 
 export function setRunStatus(runId: string, status: RunStatus): Promise<void> {
@@ -207,6 +212,33 @@ export function setRunPlan(runId: string, plan: ScenarioPlan): Promise<void> {
   return mutateRecord(runId, (r) => {
     r.plan = plan;
     r.scenariosPlanned = plan.scenarios.length;
+  });
+}
+
+export function setRunExecutionPlan(
+  runId: string,
+  execution: ExecutionPlan,
+): Promise<void> {
+  return mutateRecord(runId, (r) => {
+    r.executionPlan = execution;
+  });
+}
+
+export function setRunSchemaHash(
+  runId: string,
+  schemaHash: string,
+): Promise<void> {
+  return mutateRecord(runId, (r) => {
+    r.schemaHash = schemaHash;
+  });
+}
+
+export function setRunCacheHit(
+  runId: string,
+  cacheHit: boolean,
+): Promise<void> {
+  return mutateRecord(runId, (r) => {
+    r.cacheHit = cacheHit;
   });
 }
 

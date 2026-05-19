@@ -2,6 +2,7 @@ import { CircleAlert, TriangleAlert } from "lucide-react";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 
+import { AgentThoughts } from "@/components/agent-thoughts";
 import { RunProgress } from "@/components/run-progress";
 import { TopNav } from "@/components/top-nav";
 import { Badge } from "@/components/ui/badge";
@@ -65,6 +66,8 @@ export default async function RunPage({ params }: RunPageProps) {
         </div>
 
         <OutcomeBanner run={run} />
+
+        <AgentThoughts runId={run.id} status={run.status} />
 
         <RunProgress run={run} />
 

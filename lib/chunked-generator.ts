@@ -3,9 +3,8 @@
  *
  * The single-call generator (lib/generator.ts) hits the model's
  * output-token ceiling around ~300-600 rows depending on schema
- * width. To produce production-realistic volumes (2K-10K rows) we
- * generate one table at a time, in FK-topological order, with three
- * critical optimizations:
+ * width. We generate one table per LLM call, with three critical
+ * optimizations:
  *
  *   1. **Deterministic primary keys.** For tables with a single
  *      integer/bigint/uuid PK, we pre-allocate the PK values before
@@ -20,11 +19,13 @@
  *      values. The model must pick from the list — it cannot invent
  *      new IDs. This eliminates the entire FK-violation failure class.
  *
- *   3. **Parallel within FK stages.** Tables with no mutual FK
- *      dependency at the same topological level (e.g. `customers`
- *      and `categories`) generate concurrently via Promise.all.
- *      Different stages are sequential because later tables need
- *      earlier tables' PKs.
+ *   3. **All tables in parallel.** Because PKs are pre-allocated for
+ *      every table before any LLM call fires, FK pools are known
+ *      upfront — child tables don't need parent tables to *finish*,
+ *      only to *exist on the allocation map*. Every table's LLM call
+ *      runs concurrently via Promise.all, no FK staging gates. For
+ *      typical 8–10 table schemas this is the dominant wall-clock
+ *      win (previously 2–3 sequential rounds → now 1).
  *
  * The result is shape-compatible with the single-call generator's
  * output: a `Record<string, Record<string, unknown>[]>` keyed by
@@ -36,7 +37,6 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 
 import { structuredOutput } from "./ai";
-import { topologicalOrder } from "./canonical";
 import type {
   Column,
   ColumnType,
@@ -65,26 +65,38 @@ export interface ChunkedGenerateInput {
    * the run-store so the UI can render incremental state.
    */
   onProgress?: (event: ChunkedProgressEvent) => Promise<void> | void;
+  /**
+   * Architect-authored row allocations. When provided, bypasses the
+   * built-in `allocateRows` heuristic. Keys must be table names from
+   * `entityModel`; missing tables fall back to a small per-table
+   * baseline so FK pools are never empty.
+   */
+  externalAllocations?: Record<string, number>;
+  /**
+   * Architect-authored parallel waves. When provided, generation runs
+   * wave-by-wave (`for (wave of waves) await Promise.all(wave)`)
+   * instead of all tables concurrently. Tables not listed in any wave
+   * are added to the final wave so coverage is guaranteed.
+   */
+  externalParallelGroups?: readonly (readonly string[])[];
 }
 
 export type ChunkedProgressEvent =
   | {
       kind: "start";
       allocations: Record<string, number>;
-      stages: readonly (readonly string[])[];
       autoAllocatedKeys: Record<string, string>;
+      tableCount: number;
     }
   | {
       kind: "table-complete";
       table: string;
       rowCount: number;
-      stage: number;
     };
 
 export interface ChunkedGenerateResult {
   rows: Record<string, Record<string, unknown>[]>;
   allocations: Record<string, number>;
-  stages: readonly (readonly string[])[];
 }
 
 export async function chunkedGenerate(
@@ -94,22 +106,51 @@ export async function chunkedGenerate(
     input;
 
   const tablesByName = new Map(entityModel.tables.map((t) => [t.name, t]));
-  const order = topologicalOrder(entityModel);
-  const allocations = allocateRows(entityModel, plan, volume);
-  const stages = computeStages(entityModel, order);
+  const tableNames = entityModel.tables.map((t) => t.name);
+  const allocations = input.externalAllocations
+    ? normalizeExternalAllocations(input.externalAllocations, tableNames)
+    : allocateRows(entityModel, plan, volume);
+  const waves = input.externalParallelGroups
+    ? normalizeWaves(input.externalParallelGroups, tableNames)
+    : [tableNames];
 
-  // Pre-allocate PKs for every table that has an auto-allocatable single PK.
+  // Pre-allocate EVERY single-column UNIQUE (PK + non-PK uniques) with
+  // a deterministically-allocatable type. Two payoffs:
+  //   1. Child tables' FK pools are ready before any LLM call fires,
+  //      so the whole schema generates in one parallel round.
+  //   2. The model never has to invent unique TEXT/UUID/INT values
+  //      across sub-chunks running in parallel — those would otherwise
+  //      collide on every shared sequence (e.g. tracking_number-0,
+  //      tracking_number-1, ...) and produce thousands of UNIQUE
+  //      violations downstream.
+  //
+  // `primaryKeys` (kept as a Map<table, ScalarLiteral[]>) holds just
+  // the PK values, since FK pool construction targets the PK column.
+  // `preAllocByTable` carries the FULL set of pre-allocated values
+  // per (table, column) so we can both tell the model to omit those
+  // columns and merge the values back in afterwards.
   const primaryKeys = new Map<string, ScalarLiteral[]>();
+  const preAllocByTable = new Map<string, Record<string, ScalarLiteral[]>>();
   const autoAllocatedKeys: Record<string, string> = {};
-  for (const tableName of order) {
+  for (const tableName of tableNames) {
     const table = tablesByName.get(tableName)!;
     const count = allocations[tableName] ?? 0;
-    const pk = pickAutoAllocatablePk(table);
-    if (pk) {
-      primaryKeys.set(tableName, allocateKeys(pk, tableName, count));
-      autoAllocatedKeys[tableName] = `${pk.name} (${pk.type})`;
+    const cols = pickAutoAllocatableUniques(table);
+    const perTable: Record<string, ScalarLiteral[]> = {};
+    for (const col of cols) {
+      perTable[col.name] = allocateUniqueValues(col, tableName, count);
+    }
+    preAllocByTable.set(tableName, perTable);
+    const pkCol = cols.find((c) => c.primaryKey);
+    if (pkCol) {
+      primaryKeys.set(tableName, perTable[pkCol.name] ?? []);
     } else {
       primaryKeys.set(tableName, []);
+    }
+    if (cols.length > 0) {
+      autoAllocatedKeys[tableName] = cols
+        .map((c) => `${c.name} (${c.type})`)
+        .join(", ");
     }
   }
 
@@ -117,43 +158,44 @@ export async function chunkedGenerate(
     await onProgress({
       kind: "start",
       allocations,
-      stages,
       autoAllocatedKeys,
+      tableCount: tableNames.length,
     });
   }
 
   const generatedRows: Record<string, Record<string, unknown>[]> = {};
-  for (const tableName of order) generatedRows[tableName] = [];
+  for (const tableName of tableNames) generatedRows[tableName] = [];
 
-  // Walk stages sequentially; parallelize within a stage.
-  for (let stageIdx = 0; stageIdx < stages.length; stageIdx++) {
-    const stage = stages[stageIdx]!;
+  // Run wave-by-wave so the architect's parallelism plan is honored.
+  // Within a wave all tables run concurrently; PKs are pre-allocated
+  // across the whole schema, so cross-wave FK pools are valid before
+  // any wave fires.
+  for (const wave of waves) {
     await Promise.all(
-      stage.map(async (tableName) => {
-        const table = tablesByName.get(tableName)!;
+      wave.map(async (tableName) => {
+        const table = tablesByName.get(tableName);
+        if (!table) return;
         const count = allocations[tableName] ?? 0;
         if (count === 0) return;
 
-        const pks = primaryKeys.get(tableName) ?? [];
-        const skipPkColumn = pks.length > 0;
+        const preAlloc = preAllocByTable.get(tableName) ?? {};
+        const skipColumns = Object.keys(preAlloc);
         const fkPools = buildFkPools(table, primaryKeys);
         const scenarios = plan.scenarios.filter(
           (s) => s.predicate.table === tableName,
         );
-        const parentSample = sampleParentRows(table, generatedRows);
 
         const llmRows = await generateForTable({
           table,
           count,
-          skipPkColumn,
+          skipColumns,
           fkPools,
           scenarios,
-          parentSample,
           productContext,
           llmModel,
         });
 
-        const finalRows = mergePrimaryKeys(table, pks, llmRows);
+        const finalRows = mergePreAllocated(table, preAlloc, llmRows);
         generatedRows[tableName] = finalRows;
 
         if (onProgress) {
@@ -161,14 +203,60 @@ export async function chunkedGenerate(
             kind: "table-complete",
             table: tableName,
             rowCount: finalRows.length,
-            stage: stageIdx,
           });
         }
       }),
     );
   }
 
-  return { rows: generatedRows, allocations, stages };
+  return { rows: generatedRows, allocations };
+}
+
+/**
+ * Coerce an architect-supplied allocation map into a complete one.
+ * Tables present in the model but missing from the input get a
+ * 3-row baseline so child tables always have a non-empty FK pool.
+ */
+function normalizeExternalAllocations(
+  external: Record<string, number>,
+  modelTables: readonly string[],
+): Record<string, number> {
+  const out: Record<string, number> = {};
+  const MIN_PER_TABLE = 3;
+  for (const t of modelTables) {
+    const v = external[t];
+    out[t] =
+      typeof v === "number" && Number.isFinite(v) && v >= 0
+        ? Math.max(MIN_PER_TABLE, Math.floor(v))
+        : MIN_PER_TABLE;
+  }
+  return out;
+}
+
+/**
+ * Coerce architect-supplied parallel waves into a complete schedule.
+ * Tables missing from the schedule are appended as a trailing wave so
+ * the workflow always produces rows for every table in the model.
+ */
+function normalizeWaves(
+  external: readonly (readonly string[])[],
+  modelTables: readonly string[],
+): string[][] {
+  const seen = new Set<string>();
+  const out: string[][] = [];
+  for (const wave of external) {
+    const filtered: string[] = [];
+    for (const t of wave) {
+      if (modelTables.includes(t) && !seen.has(t)) {
+        filtered.push(t);
+        seen.add(t);
+      }
+    }
+    if (filtered.length > 0) out.push(filtered);
+  }
+  const missing = modelTables.filter((t) => !seen.has(t));
+  if (missing.length > 0) out.push(missing);
+  return out;
 }
 
 // ---------------------------------------------------------------------
@@ -236,59 +324,10 @@ function allocateRows(
 }
 
 // ---------------------------------------------------------------------
-// Stages: parallel-safe groupings of the FK topological order
-// ---------------------------------------------------------------------
-
-function computeStages(
-  model: EntityModel,
-  order: readonly string[],
-): readonly (readonly string[])[] {
-  // For each table, the set of tables it depends on (excluding self-refs).
-  const deps = new Map<string, Set<string>>();
-  for (const t of model.tables) {
-    const set = new Set<string>();
-    for (const c of t.columns) {
-      if (c.references && c.references.table !== t.name) {
-        if (model.tables.some((other) => other.name === c.references!.table)) {
-          set.add(c.references.table);
-        }
-      }
-    }
-    deps.set(t.name, set);
-  }
-
-  const placed = new Set<string>();
-  const stages: string[][] = [];
-  const remaining = new Set(order);
-
-  while (remaining.size > 0) {
-    const stage: string[] = [];
-    for (const t of order) {
-      if (!remaining.has(t)) continue;
-      const d = deps.get(t) ?? new Set();
-      const satisfied = [...d].every((parent) => placed.has(parent));
-      if (satisfied) stage.push(t);
-    }
-    if (stage.length === 0) {
-      // Cycle: emit remaining as one final stage in topological order.
-      stages.push([...remaining]);
-      break;
-    }
-    for (const t of stage) {
-      placed.add(t);
-      remaining.delete(t);
-    }
-    stages.push(stage);
-  }
-
-  return stages;
-}
-
-// ---------------------------------------------------------------------
 // Deterministic key allocation
 // ---------------------------------------------------------------------
 
-function pickAutoAllocatablePk(table: Table): Column | null {
+export function pickAutoAllocatablePk(table: Table): Column | null {
   const pkCols = table.columns.filter((c) => c.primaryKey);
   if (pkCols.length !== 1) return null; // composite PK → let model handle
   const pk = pkCols[0]!;
@@ -302,7 +341,79 @@ function pickAutoAllocatablePk(table: Table): Column | null {
   return null;
 }
 
-function allocateKeys(
+/**
+ * All single-column UNIQUE columns we can deterministically pre-fill —
+ * the PK if its type is allocatable, plus every non-PK single-column
+ * UNIQUE on a text/integer/bigint/uuid column. Composite uniques
+ * (`Table.uniqueConstraints`) are NOT included; they still go through
+ * the model and rely on bulk repair for any collisions.
+ */
+export function pickAutoAllocatableUniques(table: Table): Column[] {
+  const cols: Column[] = [];
+  // PK first so its index is 0 in callers iterating in order.
+  const pk = pickAutoAllocatablePk(table);
+  if (pk) cols.push(pk);
+  for (const c of table.columns) {
+    if (c.primaryKey) continue; // already handled above
+    if (!c.unique) continue;
+    if (!isAllocatableUniqueType(c.type)) continue;
+    cols.push(c);
+  }
+  return cols;
+}
+
+function isAllocatableUniqueType(type: Column["type"]): boolean {
+  return (
+    type === "integer" ||
+    type === "bigint" ||
+    type === "uuid" ||
+    type === "text" ||
+    type === "character varying"
+  );
+}
+
+/**
+ * Allocate `count` deterministic, distinct values for a single-column
+ * UNIQUE constraint. PK columns route through the existing
+ * `allocateKeys` (sequential ints, hash-derived UUIDs). Non-PK
+ * uniques use seeded patterns that mirror the deterministic-repair
+ * fallback (`<table>-<col>-<i>` for text, sequential for ints) so the
+ * shape is identical to what repair would have produced — except now
+ * it's done up-front and there's nothing to repair.
+ */
+export function allocateUniqueValues(
+  col: Column,
+  tableName: string,
+  count: number,
+): ScalarLiteral[] {
+  if (col.primaryKey) {
+    return allocateKeys(col, tableName, count);
+  }
+  const out: ScalarLiteral[] = [];
+  if (col.type === "integer" || col.type === "bigint") {
+    // Offset by a large constant so non-PK unique ints don't collide
+    // with PK sequences (which start at 1). Unique TEXT/UUID columns
+    // don't have this risk because their domains are disjoint.
+    const offset = 1_000_000;
+    for (let i = 0; i < count; i++) out.push(offset + i + 1);
+    return out;
+  }
+  if (col.type === "uuid") {
+    for (let i = 0; i < count; i++) {
+      out.push(deterministicUuid(`${tableName}::${col.name}::unique::${i}`));
+    }
+    return out;
+  }
+  if (col.type === "text" || col.type === "character varying") {
+    for (let i = 0; i < count; i++) {
+      out.push(`${tableName}-${col.name}-${i}`);
+    }
+    return out;
+  }
+  return out;
+}
+
+export function allocateKeys(
   pk: Column,
   tableName: string,
   count: number,
@@ -338,10 +449,10 @@ function deterministicUuid(seed: string): string {
 }
 
 // ---------------------------------------------------------------------
-// FK pools + parent samples
+// FK pools
 // ---------------------------------------------------------------------
 
-function buildFkPools(
+export function buildFkPools(
   table: Table,
   primaryKeys: Map<string, ScalarLiteral[]>,
 ): Record<string, ScalarLiteral[]> {
@@ -356,59 +467,116 @@ function buildFkPools(
   return pools;
 }
 
-function sampleParentRows(
-  table: Table,
-  generatedRows: Record<string, Record<string, unknown>[]>,
-  sampleSize = 5,
-): Record<string, Record<string, unknown>[]> {
-  const samples: Record<string, Record<string, unknown>[]> = {};
-  const fkTables = new Set<string>();
-  for (const col of table.columns) {
-    if (col.references) fkTables.add(col.references.table);
-  }
-  for (const fkTable of fkTables) {
-    const rows = generatedRows[fkTable] ?? [];
-    if (rows.length === 0) continue;
-    samples[fkTable] = rows.slice(0, Math.min(sampleSize, rows.length));
-  }
-  return samples;
-}
-
 // ---------------------------------------------------------------------
 // Per-table generation
 // ---------------------------------------------------------------------
 
-async function generateForTable(params: {
+/**
+ * Maximum rows to ask the model for in a single per-table LLM call.
+ * Above this the response JSON gets long enough that either:
+ *   - structured-output parsing fails (the model truncates on the
+ *     output-token ceiling, producing unclosed JSON), or
+ *   - the model's coherence degrades and it starts repeating rows.
+ * When `count` exceeds this we split into sub-chunks and concatenate
+ * the results. PK pre-allocation happens at the chunked-generator
+ * level, so splitting is transparent to the caller.
+ */
+const MAX_ROWS_PER_CALL = 80;
+
+export async function generateForTable(params: {
   table: Table;
   count: number;
-  skipPkColumn: boolean;
+  skipColumns: readonly string[];
   fkPools: Record<string, ScalarLiteral[]>;
   scenarios: readonly Scenario[];
-  parentSample: Record<string, Record<string, unknown>[]>;
   productContext: string;
   llmModel: string;
 }): Promise<Record<string, unknown>[]> {
+  const { count } = params;
+  if (count <= 0) return [];
+  if (count <= MAX_ROWS_PER_CALL) {
+    return generateChunk(params, count);
+  }
+
+  // Split into roughly-equal sub-chunks of <= MAX_ROWS_PER_CALL each.
+  // Bounded concurrency per table so we don't blow AI Gateway rate
+  // limits on huge tables (sibling tables in the same wave also run
+  // in parallel, so unbounded fan-out compounds quickly).
+  const chunks = splitCount(count, MAX_ROWS_PER_CALL);
+  const results = await runWithConcurrency(
+    chunks,
+    SUB_CHUNK_CONCURRENCY,
+    (chunkCount) => generateChunk(params, chunkCount),
+  );
+  return results.flat();
+}
+
+const SUB_CHUNK_CONCURRENCY = 3;
+
+async function runWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (true) {
+      const i = cursor++;
+      if (i >= items.length) return;
+      results[i] = await worker(items[i]!, i);
+    }
+  });
+  await Promise.all(runners);
+  return results;
+}
+
+function splitCount(total: number, maxPerChunk: number): number[] {
+  const out: number[] = [];
+  let remaining = total;
+  while (remaining > 0) {
+    const next = Math.min(maxPerChunk, remaining);
+    out.push(next);
+    remaining -= next;
+  }
+  return out;
+}
+
+/**
+ * One LLM call producing `count` rows. Retries once with half the row
+ * count on `AI_NoObjectGeneratedError` (the SDK's parse-failure
+ * signal), since those failures are almost always model output
+ * truncation — a smaller ask fits inside the output budget.
+ */
+async function generateChunk(
+  params: {
+    table: Table;
+    skipColumns: readonly string[];
+    fkPools: Record<string, ScalarLiteral[]>;
+    scenarios: readonly Scenario[];
+    productContext: string;
+    llmModel: string;
+  },
+  count: number,
+): Promise<Record<string, unknown>[]> {
   const {
     table,
-    count,
-    skipPkColumn,
+    skipColumns,
     fkPools,
     scenarios,
-    parentSample,
     productContext,
     llmModel,
   } = params;
 
-  const generableCols = table.columns.filter(
-    (c) => !(skipPkColumn && c.primaryKey),
-  );
+  const skipSet = new Set(skipColumns);
+  const generableCols = table.columns.filter((c) => !skipSet.has(c.name));
 
   const system = [
     `You generate seed data for a single Postgres table.`,
     `Return a JSON array of exactly ${count} row object(s) — no prose, no Markdown.`,
-    skipPkColumn
-      ? `The primary key is pre-assigned and MUST be omitted from your output.`
-      : `Generate every required column including the primary key, ensuring uniqueness.`,
+    skipColumns.length > 0
+      ? `The following columns are pre-assigned by the system and MUST be omitted from your output: ${skipColumns.join(", ")}.`
+      : `Generate every required column, ensuring uniqueness.`,
     `Foreign-key columns MUST use only values from the provided "Valid values" pools. Do not invent IDs.`,
     `Every row MUST include every listed column — do not omit fields. Nullable columns may take the value null.`,
     `Respect NOT NULL, enum value sets, CHECK constraints. Use ISO-8601 strings for timestamps and dates.`,
@@ -420,33 +588,46 @@ async function generateForTable(params: {
     count,
     fkPools,
     scenarios,
-    parentSample,
     productContext,
   });
 
-  // Per-table Zod object schema — REQUIRES every column to be present in
-  // every row, with column-type-appropriate validators. This is the
-  // binding contract AI SDK enforces on the model's response, so the
-  // model cannot return rows missing required fields.
   const rowSchema = buildRowSchema(generableCols);
   const schema = z
     .array(rowSchema)
     .min(1)
     .max(Math.max(count * 2, count + 5));
 
-  // Dynamic token budget: ~250 tokens/row + 2K overhead, capped at 32K.
-  // Per-row cost is a touch higher now that every column is required.
   const maxOutputTokens = Math.min(32_768, count * 250 + 2_048);
 
-  const { object } = await structuredOutput({
-    model: llmModel,
-    schema,
-    system,
-    prompt,
-    maxOutputTokens,
-  });
+  try {
+    const { object } = await structuredOutput({
+      model: llmModel,
+      schema,
+      system,
+      prompt,
+      maxOutputTokens,
+    });
+    return (object as Record<string, unknown>[]).slice(0, count);
+  } catch (err) {
+    // Output-truncation parse failures are recoverable by asking for
+    // fewer rows. Re-throw any other class of error.
+    if (!isObjectParseError(err) || count <= 4) throw err;
+    const half = Math.max(4, Math.floor(count / 2));
+    const rest = count - half;
+    const first = await generateChunk(params, half);
+    if (rest <= 0) return first;
+    const second = await generateChunk(params, rest);
+    return first.concat(second);
+  }
+}
 
-  return (object as Record<string, unknown>[]).slice(0, count);
+function isObjectParseError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const e = err as { name?: string; message?: string };
+  if (e.name === "AI_NoObjectGeneratedError") return true;
+  if (typeof e.message === "string" && e.message.includes("could not parse"))
+    return true;
+  return false;
 }
 
 /**
@@ -509,7 +690,6 @@ function buildTablePrompt(params: {
   count: number;
   fkPools: Record<string, ScalarLiteral[]>;
   scenarios: readonly Scenario[];
-  parentSample: Record<string, Record<string, unknown>[]>;
   productContext: string;
 }): string {
   const {
@@ -518,7 +698,6 @@ function buildTablePrompt(params: {
     count,
     fkPools,
     scenarios,
-    parentSample,
     productContext,
   } = params;
 
@@ -559,19 +738,6 @@ function buildTablePrompt(params: {
     parts.push("");
   }
 
-  if (Object.keys(parentSample).length > 0) {
-    parts.push(
-      `Parent row samples (so your rows correlate naturally — e.g. matching FKs to the right parent personalities):`,
-    );
-    for (const [parentTable, rows] of Object.entries(parentSample)) {
-      parts.push(`  ${parentTable}:`);
-      for (const row of rows) {
-        parts.push(`    ${JSON.stringify(row)}`);
-      }
-    }
-    parts.push("");
-  }
-
   if (scenarios.length > 0) {
     parts.push(
       `Scenarios that MUST be satisfied by at least one row in this table:`,
@@ -592,22 +758,48 @@ function buildTablePrompt(params: {
 // Merge pre-allocated PKs back into LLM rows
 // ---------------------------------------------------------------------
 
-function mergePrimaryKeys(
+export function mergePrimaryKeys(
   table: Table,
   pks: readonly ScalarLiteral[],
   llmRows: readonly Record<string, unknown>[],
 ): Record<string, unknown>[] {
-  if (pks.length === 0) {
-    // Composite PK or text PK: return rows as the model produced them.
-    return llmRows.map((r) => ({ ...r }));
-  }
+  // Back-compat shim: same semantics as the previous single-PK merge.
+  // New code paths should use `mergePreAllocated` instead.
+  if (pks.length === 0) return llmRows.map((r) => ({ ...r }));
   const pkCol = table.columns.find((c) => c.primaryKey);
   if (!pkCol) return llmRows.map((r) => ({ ...r }));
-  // Use min(pks, llmRows) so an undershooting model doesn't get phantom rows.
-  const len = Math.min(pks.length, llmRows.length);
+  return mergePreAllocated(table, { [pkCol.name]: [...pks] }, llmRows);
+}
+
+/**
+ * Merge pre-allocated values for one OR MORE columns back into the
+ * LLM's rows. Each entry in `preAlloc` is a column name plus its
+ * deterministic sequence; the i-th row gets the i-th value from every
+ * sequence. Order in the output is preserved.
+ *
+ * If the model returns fewer rows than were allocated, we keep only
+ * `min(allocated, generated)` rows — so an undershooting call doesn't
+ * leave phantom rows holding pre-allocated unique values without any
+ * accompanying scenario data.
+ */
+export function mergePreAllocated(
+  _table: Table,
+  preAlloc: Record<string, readonly ScalarLiteral[]>,
+  llmRows: readonly Record<string, unknown>[],
+): Record<string, unknown>[] {
+  const cols = Object.keys(preAlloc);
+  if (cols.length === 0) return llmRows.map((r) => ({ ...r }));
+  const allocatedLen = Math.min(
+    ...cols.map((c) => preAlloc[c]!.length),
+  );
+  const len = Math.min(allocatedLen, llmRows.length);
   const merged: Record<string, unknown>[] = [];
   for (let i = 0; i < len; i++) {
-    merged.push({ [pkCol.name]: pks[i], ...llmRows[i] });
+    const row: Record<string, unknown> = { ...llmRows[i] };
+    for (const c of cols) {
+      row[c] = preAlloc[c]![i]!;
+    }
+    merged.push(row);
   }
   return merged;
 }

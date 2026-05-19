@@ -22,9 +22,22 @@ import {
 } from "workflow";
 
 import { parseSchema, UnsupportedConstructError, SchemaParseError } from "@/lib/parser";
-import { generatePlan } from "@/lib/planner";
-import { generateRepair } from "@/lib/generator";
+import {
+  ArchitectPlanError,
+  buildFallbackPlan,
+  runArchitectAgent,
+  synthesizeDeterministicPlan,
+} from "@/lib/architect-agent";
 import { chunkedGenerate } from "@/lib/chunked-generator";
+import { runCoverageBoost } from "@/lib/coverage-boost";
+import { runRepairAgent, type ToolCallTrace } from "@/lib/repair-agent";
+import { publishAgentThought } from "@/lib/run-stream";
+import {
+  buildCacheEntry,
+  getCachedDataset,
+  hashEntityModel,
+  putCachedDataset,
+} from "@/lib/run-cache";
 import { validateShape, StructuralShapeError } from "@/lib/shape-validate";
 import { validateDataset } from "@/lib/validate";
 import { toCanonical } from "@/lib/canonical";
@@ -34,23 +47,35 @@ import {
   ensureRunRecord,
   markRunCancelled,
   markRunFailed,
+  setRunCacheHit,
   setRunDataset,
+  setRunExecutionPlan,
   setRunPlan,
   setRunReport,
+  setRunSchemaHash,
   setRunStatus,
   setRunStep,
 } from "@/lib/run-store";
 import type {
+  ArchitectPlan,
   CanonicalDataset,
   EntityModel,
+  ExecutionPlan,
   ReadinessReport,
   ScenarioEvaluation,
   ScenarioPlan,
   ValidationReport,
 } from "@/lib/types";
 
+/**
+ * Planning needs scenario reasoning; repair needs to interpret failure
+ * messages and produce structurally-correct replacements. Both stay on
+ * Sonnet. Generation is heavily constrained — pre-allocated PKs, FK
+ * value pools, Zod-typed columns — so it's a slot-filling task, and
+ * Haiku 4.5 hits it 3–4× faster at indistinguishable structural quality.
+ */
 export const RUN_LLM_MODEL = "anthropic/claude-sonnet-4-6";
-const REPAIR_RETRY_CAP = 3;
+export const GEN_LLM_MODEL = "anthropic/claude-haiku-4-5";
 /**
  * Minimum acceptable generated rows as a fraction of the requested
  * volume. With chunked generation (lib/chunked-generator.ts) hitting
@@ -122,50 +147,198 @@ async function stepParse(runId: string, ddl: string): Promise<EntityModel> {
 }
 stepParse.maxRetries = 0;
 
-async function stepPlan(
+async function stepHashSchema(
+  runId: string,
+  entityModel: EntityModel,
+): Promise<string> {
+  "use step";
+  const hash = hashEntityModel(entityModel);
+  await setRunSchemaHash(runId, hash);
+  return hash;
+}
+stepHashSchema.maxRetries = 0;
+
+/**
+ * The architect agent designs scenarios AND the execution plan
+ * (parallelism, allocations, optional steps, cache reuse). When the
+ * agent fails to produce a valid plan we fall back to the legacy
+ * scenarios-only planner plus a deterministic execution plan.
+ */
+async function stepArchitect(
   runId: string,
   entityModel: EntityModel,
   productContext: string,
-): Promise<ScenarioPlan> {
+  volume: number,
+  schemaHash: string,
+): Promise<ArchitectPlan> {
   "use step";
   await setRunStep(runId, "plan", "running");
   try {
-    const plan = await generatePlan({
-      model: entityModel,
+    const result = await runArchitectAgent({
+      entityModel,
       productContext,
       llmModel: RUN_LLM_MODEL,
+      schemaHash,
+      volume,
     });
-    if (plan.scenarios.length === 0) {
-      throw new Error("Planner returned 0 scenarios — cannot proceed without anything to verify.");
+    if (result.plan.scenarios.length === 0) {
+      throw new Error(
+        "Architect returned 0 scenarios — cannot proceed without anything to verify.",
+      );
     }
-    await setRunPlan(runId, plan);
-    await setRunStep(
-      runId,
-      "plan",
-      "succeeded",
-      `${plan.scenarios.length} scenario${plan.scenarios.length === 1 ? "" : "s"}`,
-      {
-        scenarioCount: plan.scenarios.length,
-        scenarios: plan.scenarios.map((s) => ({
-          id: s.id,
-          name: s.name,
-          table: s.predicate.table,
-        })),
-      },
-    );
-    return plan;
+    await persistArchitectPlan(runId, result.plan, result.toolCalls.length);
+    return result.plan;
   } catch (e) {
+    if (e instanceof ArchitectPlanError) {
+      // Architect's plan was invalid — fall back to legacy planner +
+      // deterministic execution plan rather than failing the run.
+      await setRunStep(
+        runId,
+        "plan",
+        "running",
+        `architect rejected (${e.issues.length} issue${e.issues.length === 1 ? "" : "s"}) — falling back`,
+      );
+      try {
+        const fallback = await buildFallbackPlan({
+          entityModel,
+          productContext,
+          llmModel: RUN_LLM_MODEL,
+          volume,
+        });
+        await persistArchitectPlan(runId, fallback, 0, {
+          fallback: true,
+          architectIssues: e.issues,
+        });
+        return fallback;
+      } catch (fallbackErr) {
+        const msg =
+          fallbackErr instanceof Error
+            ? fallbackErr.message
+            : String(fallbackErr);
+        await setRunStep(runId, "plan", "failed", msg, { error: msg });
+        await markRunFailed(runId, `plan: ${msg}`);
+        throw new FatalError(msg);
+      }
+    }
     const msg = e instanceof Error ? e.message : String(e);
     await setRunStep(runId, "plan", "failed", msg, { error: msg });
     await markRunFailed(runId, `plan: ${msg}`);
     throw new FatalError(msg);
   }
 }
-// Plan is a single LLM call; let the AI SDK retry transient failures
-// (network blips, model 5xx) up to the WDK default. Don't add a higher
-// cap here — repeated planner failures usually indicate a structural
-// problem (model can't honor the schema).
-stepPlan.maxRetries = 2;
+stepArchitect.maxRetries = 2;
+
+async function persistArchitectPlan(
+  runId: string,
+  plan: ArchitectPlan,
+  toolCallCount: number,
+  extra?: Record<string, unknown>,
+): Promise<void> {
+  const scenarioPlan: ScenarioPlan = { scenarios: plan.scenarios };
+  await setRunPlan(runId, scenarioPlan);
+  await setRunExecutionPlan(runId, plan.execution);
+  await setRunStep(
+    runId,
+    "plan",
+    "succeeded",
+    `${plan.scenarios.length} scenario${plan.scenarios.length === 1 ? "" : "s"} · ${plan.execution.parallelGroups.length} wave(s) · cache=${plan.execution.cacheDecision.kind}`,
+    {
+      scenarioCount: plan.scenarios.length,
+      scenarios: plan.scenarios.map((s) => ({
+        id: s.id,
+        name: s.name,
+        table: s.predicate.table,
+      })),
+      executionPlan: plan.execution,
+      toolCallCount,
+      reasoning: plan.execution.reasoning,
+      ...(extra ?? {}),
+    },
+  );
+}
+
+/**
+ * Honor the architect's cache decision. When `reuse`, load the cached
+ * dataset and short-circuit generation. When `regenerate`, mark the
+ * step succeeded with the reason and let generation proceed.
+ */
+async function stepCache(
+  runId: string,
+  execution: ExecutionPlan,
+  schemaHash: string,
+): Promise<Record<string, Record<string, unknown>[]> | undefined> {
+  "use step";
+  await setRunStep(runId, "cache", "running");
+  if (execution.cacheDecision.kind === "regenerate") {
+    await setRunCacheHit(runId, false);
+    await setRunStep(
+      runId,
+      "cache",
+      "succeeded",
+      "regenerating · agent chose fresh data",
+      {
+        decision: "regenerate",
+        reason: execution.cacheDecision.reason,
+      },
+    );
+    return undefined;
+  }
+  const entry = await getCachedDataset(
+    schemaHash,
+    execution.cacheDecision.sourceRunId,
+  );
+  if (!entry) {
+    // Race: cache was visible to the architect but gone now. Fail
+    // open by regenerating rather than failing the run.
+    await setRunCacheHit(runId, false);
+    await setRunStep(
+      runId,
+      "cache",
+      "succeeded",
+      "cache miss · entry disappeared, regenerating",
+      {
+        decision: "regenerate",
+        reason: "Cached entry disappeared between architect inspection and load.",
+        sourceRunId: execution.cacheDecision.sourceRunId,
+      },
+    );
+    return undefined;
+  }
+  // Rehydrate raw dataset (the cache stores canonical; we want the
+  // raw record-array shape the rest of the pipeline expects).
+  const rawDataset: Record<string, Record<string, unknown>[]> = {};
+  for (const [t, rows] of Object.entries(entry.dataset.tables)) {
+    rawDataset[t] = rows.map((r) => ({ ...r }));
+  }
+  await setRunCacheHit(runId, true);
+  await setRunStep(
+    runId,
+    "cache",
+    "succeeded",
+    `cache hit · reusing ${entry.totalRows} rows from ${entry.sourceRunId.slice(0, 8)}`,
+    {
+      decision: "reuse",
+      sourceRunId: entry.sourceRunId,
+      reason: execution.cacheDecision.reason,
+      sourceCreatedAt: entry.createdAt,
+      totalRows: entry.totalRows,
+      tableRowCounts: entry.tableRowCounts,
+    },
+  );
+  return rawDataset;
+}
+stepCache.maxRetries = 1;
+
+async function stepMarkGenerateSkipped(runId: string) {
+  "use step";
+  await setRunStep(
+    runId,
+    "generate",
+    "skipped",
+    "skipped · cache reused",
+  );
+}
+stepMarkGenerateSkipped.maxRetries = 0;
 
 async function stepMarkConfirmRunning(runId: string) {
   "use step";
@@ -192,6 +365,7 @@ async function stepGenerate(
   runId: string,
   entityModel: EntityModel,
   plan: ScenarioPlan,
+  execution: ExecutionPlan,
   productContext: string,
   volume: number,
 ): Promise<Record<string, Record<string, unknown>[]>> {
@@ -201,8 +375,8 @@ async function stepGenerate(
 
   const tableProgress: Record<string, number> = {};
   let allocations: Record<string, number> = {};
-  let stages: readonly (readonly string[])[] = [];
   let autoAllocatedKeys: Record<string, string> = {};
+  let tableCount = entityModel.tables.length;
 
   try {
     const result = await chunkedGenerate({
@@ -210,21 +384,22 @@ async function stepGenerate(
       plan,
       volume,
       productContext,
-      llmModel: RUN_LLM_MODEL,
+      llmModel: GEN_LLM_MODEL,
+      externalAllocations: execution.tableAllocations,
+      externalParallelGroups: execution.parallelGroups,
       onProgress: async (event) => {
         if (event.kind === "start") {
           allocations = event.allocations;
-          stages = event.stages;
           autoAllocatedKeys = event.autoAllocatedKeys;
+          tableCount = event.tableCount;
           await setRunStep(
             runId,
             "generate",
             "running",
-            `chunked across ${entityModel.tables.length} table(s) in ${stages.length} FK stage(s)`,
+            `${tableCount} table(s) in parallel`,
             {
               chunked: true,
               allocations,
-              stages: stages.map((s) => [...s]),
               autoAllocatedKeys,
               tableProgress: {},
               requestedVolume: volume,
@@ -243,11 +418,10 @@ async function stepGenerate(
             runId,
             "generate",
             "running",
-            `stage ${event.stage + 1}/${stages.length} · ${done}/${entityModel.tables.length} tables · ${totalSoFar} rows so far`,
+            `${done}/${tableCount} tables · ${totalSoFar} rows so far`,
             {
               chunked: true,
               allocations,
-              stages: stages.map((s) => [...s]),
               autoAllocatedKeys,
               tableProgress: { ...tableProgress },
               requestedVolume: volume,
@@ -283,13 +457,12 @@ async function stepGenerate(
       runId,
       "generate",
       "succeeded",
-      `${totalRows} row${totalRows === 1 ? "" : "s"} across ${Object.keys(rowsByTable).filter((t) => rowsByTable[t] > 0).length} table(s) · chunked`,
+      `${totalRows} row${totalRows === 1 ? "" : "s"} across ${Object.keys(rowsByTable).filter((t) => rowsByTable[t] > 0).length} table(s) · parallel`,
       {
         chunked: true,
         totalRows,
         requestedVolume: volume,
         allocations,
-        stages: stages.map((s) => [...s]),
         autoAllocatedKeys,
         tableProgress,
         rowsByTable,
@@ -306,7 +479,6 @@ async function stepGenerate(
       chunked: true,
       error: msg,
       allocations,
-      stages: stages.map((s) => [...s]),
       tableProgress,
     });
     await markRunFailed(runId, `generate: ${msg}`);
@@ -321,77 +493,21 @@ async function stepValidateAndRepair(
   plan: ScenarioPlan,
   rawDataset: Record<string, Record<string, unknown>[]>,
   productContext: string,
-  volume: number,
 ): Promise<{ canonicalDataset: CanonicalDataset; validation: ValidationReport }> {
   "use step";
   await setRunStep(runId, "validate", "running");
-  let current = rawDataset;
-  let canonical = toCanonical(current, entityModel);
+  let canonical = toCanonical(rawDataset, entityModel);
   let validation = validateDataset(canonical, entityModel);
-  let attempt = 0;
+  const initialFailureCount = validation.failures.length;
 
-  while (validation.failures.length > 0 && attempt < REPAIR_RETRY_CAP) {
-    await setRunStep(
-      runId,
-      "repair",
-      "running",
-      `repair attempt ${attempt + 1}/${REPAIR_RETRY_CAP} · ${validation.failures.length} failure(s)`,
-    );
-    const failures = validation.failures.map((f) => ({
-      table: f.table,
-      index: f.rowIndex,
-      reason: `${f.constraint}: ${f.detail}`,
-      row: current[f.table]?.[f.rowIndex],
-    }));
-    const replacements = await generateRepair({
-      model: entityModel,
-      plan,
-      volume,
-      productContext,
-      llmModel: RUN_LLM_MODEL,
-      failures,
-    });
-
-    const indicesByTable: Record<string, number[]> = {};
-    for (const f of validation.failures) {
-      const k = f.table;
-      if (!indicesByTable[k]) indicesByTable[k] = [];
-      if (!indicesByTable[k].includes(f.rowIndex)) indicesByTable[k].push(f.rowIndex);
-    }
-
-    const next: typeof current = {};
-    for (const [tbl, rows] of Object.entries(current)) {
-      next[tbl] = rows.map((r) => ({ ...r }));
-    }
-    for (const [tbl, replRows] of Object.entries(replacements)) {
-      const key = tbl.toLowerCase();
-      const target = next[key];
-      const targets = indicesByTable[key] ?? [];
-      if (!target) continue;
-      targets.forEach((rowIdx, i) => {
-        const repl = (replRows as Record<string, unknown>[])[i];
-        if (repl && rowIdx < target.length) {
-          target[rowIdx] = repl;
-        }
-      });
-    }
-
-    current = next;
-    canonical = toCanonical(current, entityModel);
-    validation = validateDataset(canonical, entityModel);
-    attempt++;
-  }
-
-  const failuresByConstraint: Record<string, number> = {};
+  // Tell the UI we observed the failures before the agent does anything.
+  const initialByConstraint: Record<string, number> = {};
+  const initialByTable: Record<string, number> = {};
   for (const f of validation.failures) {
-    failuresByConstraint[f.constraint] =
-      (failuresByConstraint[f.constraint] ?? 0) + 1;
+    initialByConstraint[f.constraint] =
+      (initialByConstraint[f.constraint] ?? 0) + 1;
+    initialByTable[f.table] = (initialByTable[f.table] ?? 0) + 1;
   }
-  const failuresByTable: Record<string, number> = {};
-  for (const f of validation.failures) {
-    failuresByTable[f.table] = (failuresByTable[f.table] ?? 0) + 1;
-  }
-
   await setRunStep(
     runId,
     "validate",
@@ -402,8 +518,8 @@ async function stepValidateAndRepair(
       passingRecords: validation.passingRecords,
       passRate: validation.passRate,
       failureCount: validation.failures.length,
-      failuresByConstraint,
-      failuresByTable,
+      failuresByConstraint: initialByConstraint,
+      failuresByTable: initialByTable,
       sampleFailures: validation.failures.slice(0, 5).map((f) => ({
         table: f.table,
         rowIndex: f.rowIndex,
@@ -413,19 +529,88 @@ async function stepValidateAndRepair(
       })),
     },
   );
+
+  if (initialFailureCount === 0) {
+    await setRunStep(runId, "repair", "succeeded", "no failures to repair", {
+      initialFailures: 0,
+      finalFailures: 0,
+      toolCalls: [] as ToolCallTrace[],
+    });
+    return { canonicalDataset: canonical, validation };
+  }
+
   await setRunStep(
     runId,
     "repair",
-    validation.failures.length === 0 ? "succeeded" : "failed",
-    validation.failures.length === 0
-      ? attempt === 0
-        ? "no failures to repair"
-        : `cleared ${attempt} round(s) of failures`
-      : `${validation.failures.length} unresolved after ${attempt} attempt(s)`,
+    "running",
+    `agent starting · ${initialFailureCount} failure(s)`,
     {
-      attempts: attempt,
-      cap: REPAIR_RETRY_CAP,
-      unresolved: validation.failures.length,
+      initialFailures: initialFailureCount,
+      toolCalls: [] as ToolCallTrace[],
+    },
+  );
+
+  const toolCalls: ToolCallTrace[] = [];
+
+  const agent = await runRepairAgent({
+    initialDataset: rawDataset,
+    initialFailures: validation.failures,
+    entityModel,
+    plan,
+    productContext,
+    llmModel: RUN_LLM_MODEL,
+    stepCap: 24,
+    onToolCall: async (event) => {
+      toolCalls.push(event);
+      // Push an incremental snapshot so the UI can stream the trace.
+      // We re-write the full toolCalls array since setRunStep merges
+      // details shallowly — a deep array merge would be brittle.
+      await setRunStep(
+        runId,
+        "repair",
+        "running",
+        `agent · ${event.name}${event.ok ? "" : " (failed)"} · ${toolCalls.length} call(s)`,
+        {
+          initialFailures: initialFailureCount,
+          toolCalls: [...toolCalls],
+        },
+      );
+      // Also mirror to the namespaced agent-thoughts stream so the
+      // narration panel sees architect + repair on one channel.
+      await publishAgentThought({
+        agent: "repair",
+        at: event.at,
+        kind: "tool-call",
+        toolName: event.name,
+        message: `${event.name}${event.ok ? "" : " (failed)"} · total failures now ${
+          (event.result?.totalFailures as number | undefined) ?? "?"
+        }`,
+        data: event.result,
+      });
+    },
+  });
+
+  canonical = toCanonical(agent.dataset, entityModel);
+  validation = agent.validation;
+  const finalFailures = validation.failures.length;
+
+  const stoppedReason = agent.stoppedReason;
+  const cleared = initialFailureCount - finalFailures;
+
+  await setRunStep(
+    runId,
+    "repair",
+    finalFailures === 0 ? "succeeded" : "failed",
+    finalFailures === 0
+      ? `agent cleared ${cleared} failure(s) in ${agent.toolCalls.length} tool call(s)`
+      : `${finalFailures} unresolved after ${agent.toolCalls.length} tool call(s) — stopped: ${stoppedReason}`,
+    {
+      initialFailures: initialFailureCount,
+      finalFailures,
+      cleared,
+      toolCalls: [...toolCalls],
+      stoppedReason,
+      ...(agent.errorMessage ? { error: agent.errorMessage } : {}),
     },
   );
 
@@ -464,6 +649,93 @@ async function stepPredicateEvaluate(
   return evaluations;
 }
 stepPredicateEvaluate.maxRetries = 0;
+
+/**
+ * Optional coverage-boost step. Runs only when the architect enabled
+ * it AND there are uninstantiated scenarios. Regenerates rows for the
+ * tables that anchor missing scenarios, then re-evaluates predicates
+ * on the merged dataset. Replaces the canonical + evaluations with
+ * the post-boost versions.
+ */
+async function stepCoverageBoost(
+  runId: string,
+  entityModel: EntityModel,
+  plan: ScenarioPlan,
+  execution: ExecutionPlan,
+  rawDataset: Record<string, Record<string, unknown>[]>,
+  evaluations: readonly ScenarioEvaluation[],
+  productContext: string,
+): Promise<{
+  canonicalDataset: CanonicalDataset;
+  validation: ValidationReport;
+  evaluations: readonly ScenarioEvaluation[];
+  ran: boolean;
+}> {
+  "use step";
+  const missing = evaluations
+    .filter((e) => !e.instantiated)
+    .map((e) => e.scenarioId);
+  const enabled = execution.optionalSteps.includes("coverage-boost");
+  if (!enabled || missing.length === 0) {
+    // Compute current canonical / validation so callers always get a
+    // fully-typed result, even when boost is skipped.
+    const canonical = toCanonical(rawDataset, entityModel);
+    const validation = validateDataset(canonical, entityModel);
+    await setRunStep(
+      runId,
+      "coverage-boost",
+      "skipped",
+      enabled
+        ? "no missing scenarios — boost unnecessary"
+        : "architect did not enable coverage-boost",
+      {
+        enabled,
+        missingScenarios: missing,
+      },
+    );
+    return { canonicalDataset: canonical, validation, evaluations, ran: false };
+  }
+  await setRunStep(
+    runId,
+    "coverage-boost",
+    "running",
+    `boosting ${missing.length} missing scenario(s)`,
+    { enabled: true, missingScenarios: missing },
+  );
+  const boost = await runCoverageBoost({
+    entityModel,
+    plan,
+    productContext,
+    llmModel: RUN_LLM_MODEL,
+    dataset: rawDataset,
+    missingScenarioIds: missing,
+  });
+  const canonical = toCanonical(rawDataset, entityModel);
+  const validation = validateDataset(canonical, entityModel);
+  const reEvaluations = evaluatePlan(plan, canonical);
+  const instantiatedAfter = reEvaluations.filter((e) => e.instantiated).length;
+  await setRunStep(
+    runId,
+    "coverage-boost",
+    "succeeded",
+    `added ${boost.totalAddedRows} row(s) across ${boost.perTable.length} table(s)`,
+    {
+      enabled: true,
+      missingScenariosBefore: missing,
+      perTable: boost.perTable,
+      totalAddedRows: boost.totalAddedRows,
+      instantiatedAfter,
+      totalScenarios: plan.scenarios.length,
+    },
+  );
+  return {
+    canonicalDataset: canonical,
+    validation,
+    evaluations: reEvaluations,
+    ran: true,
+  };
+}
+stepCoverageBoost.maxRetries = 0;
 
 async function stepScore(
   runId: string,
@@ -506,27 +778,61 @@ async function stepPersist(
   runId: string,
   canonicalDataset: CanonicalDataset,
   report: ReadinessReport,
+  cacheArgs?: {
+    schemaHash: string;
+    productContext: string;
+    requestedVolume: number;
+    plan: ScenarioPlan;
+  },
 ) {
   "use step";
   await setRunStep(runId, "persist", "running");
   await setRunDataset(runId, canonicalDataset);
   const finalStatus = decideFinalStatus(report);
-  await setRunStatus(runId, finalStatus);
   const totalRows = Object.values(canonicalDataset.tables).reduce(
     (sum, rows) => sum + rows.length,
     0,
   );
+
+  // Cache the canonical dataset so future runs with the same schema
+  // shape can short-circuit generation. We only cache fully-successful
+  // runs — partials may have constraint violations we shouldn't reuse.
+  let cached = false;
+  if (cacheArgs && finalStatus === "succeeded") {
+    try {
+      await putCachedDataset(
+        buildCacheEntry({
+          schemaHash: cacheArgs.schemaHash,
+          sourceRunId: runId,
+          productContext: cacheArgs.productContext,
+          requestedVolume: cacheArgs.requestedVolume,
+          plan: cacheArgs.plan,
+          dataset: canonicalDataset,
+        }),
+      );
+      cached = true;
+    } catch {
+      // Cache write is best-effort; don't fail the run.
+    }
+  }
+
+  // Mark the persist step succeeded BEFORE flipping run.status to a
+  // terminal value. The streaming client tears down on terminal status
+  // — if status flipped first, the client would abort before seeing the
+  // step transition and Persist would render stuck on "running".
   await setRunStep(
     runId,
     "persist",
     "succeeded",
-    `persisted · status ${finalStatus}`,
+    `persisted · status ${finalStatus}${cached ? " · cached" : ""}`,
     {
       totalRows,
       tableCount: canonicalDataset.tableOrder.length,
       finalStatus,
+      cached,
     },
   );
+  await setRunStatus(runId, finalStatus);
 }
 stepPersist.maxRetries = 0;
 
@@ -540,7 +846,15 @@ export async function runWorkflow(input: RunWorkflowInput) {
 
   await stepInit(runId, input);
   const entityModel = await stepParse(runId, input.schema);
-  const plan = await stepPlan(runId, entityModel, input.context);
+  const schemaHash = await stepHashSchema(runId, entityModel);
+  const architectPlan = await stepArchitect(
+    runId,
+    entityModel,
+    input.context,
+    input.volume,
+    schemaHash,
+  );
+  const scenarioPlan: ScenarioPlan = { scenarios: architectPlan.scenarios };
 
   await stepMarkConfirmRunning(runId);
   const hook = createHook<{ confirmed: boolean }>({
@@ -555,24 +869,55 @@ export async function runWorkflow(input: RunWorkflowInput) {
 
   await stepMarkConfirmed(runId);
 
-  const rawDataset = await stepGenerate(
+  // Cache decision is the architect's. When `reuse`, we get a raw
+  // dataset back and skip generation entirely. When `regenerate`, we
+  // generate fresh.
+  const cachedRaw = await stepCache(runId, architectPlan.execution, schemaHash);
+  const rawDataset = cachedRaw
+    ? (await stepMarkGenerateSkipped(runId), cachedRaw)
+    : await stepGenerate(
+        runId,
+        entityModel,
+        scenarioPlan,
+        architectPlan.execution,
+        input.context,
+        input.volume,
+      );
+  const { canonicalDataset: initialCanonical, validation: initialValidation } =
+    await stepValidateAndRepair(
+      runId,
+      entityModel,
+      scenarioPlan,
+      rawDataset,
+      input.context,
+    );
+  const initialEvaluations = await stepPredicateEvaluate(
     runId,
-    entityModel,
-    plan,
-    input.context,
-    input.volume,
+    scenarioPlan,
+    initialCanonical,
   );
-  const { canonicalDataset, validation } = await stepValidateAndRepair(
+
+  // Optional coverage-boost — runs only if the architect enabled it
+  // AND scenarios are missing.
+  const boost = await stepCoverageBoost(
     runId,
     entityModel,
-    plan,
+    scenarioPlan,
+    architectPlan.execution,
     rawDataset,
+    initialEvaluations,
     input.context,
-    input.volume,
   );
-  const evaluations = await stepPredicateEvaluate(runId, plan, canonicalDataset);
-  const report = await stepScore(runId, plan, validation, evaluations);
-  await stepPersist(runId, canonicalDataset, report);
+  const canonicalDataset = boost.canonicalDataset;
+  const validation = boost.validation;
+  const evaluations = boost.evaluations;
+  const report = await stepScore(runId, scenarioPlan, validation, evaluations);
+  await stepPersist(runId, canonicalDataset, report, {
+    schemaHash,
+    productContext: input.context,
+    requestedVolume: input.volume,
+    plan: scenarioPlan,
+  });
 
   return {
     runId,

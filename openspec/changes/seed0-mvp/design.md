@@ -1,5 +1,11 @@
 # Design: seed0 MVP
 
+> **Historical — superseded.** This document describes the originally-planned
+> architecture (single-call generator with two retry loops). The shipped
+> system is a three-layer composition (deterministic Vercel Workflow +
+> architect agent + chunked generator + repair agent). See `README.md` for
+> the current design. Kept here for traceability of decisions only.
+
 Locked technical decisions. Each is a defensible interview talking point; the
 rationale text is the answer to "why did you do it this way?"
 

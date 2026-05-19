@@ -52,11 +52,13 @@ export default async function RunsHistoryPage() {
       <TopNav current="runs" />
       <main className="mx-auto flex w-full max-w-5xl flex-1 flex-col gap-6 px-6 py-10">
         <div className="flex items-end justify-between gap-4">
-          <div>
-            <h1 className="text-2xl font-semibold tracking-tight">Runs</h1>
+          <div className="flex flex-col gap-1">
+            <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
+              History
+            </span>
+            <h1 className="text-3xl font-semibold tracking-tight">Runs</h1>
             <p className="text-sm text-muted-foreground">
-              Past runs derived from Vercel Blob prefix listing, ordered by
-              recency.
+              Every seed run you&apos;ve started, newest first.
             </p>
           </div>
           <Link href="/new">
@@ -66,10 +68,10 @@ export default async function RunsHistoryPage() {
 
         <Card>
           <CardHeader className="gap-2">
-            <CardTitle className="text-base font-semibold">History</CardTitle>
+            <CardTitle className="text-base font-semibold">All runs</CardTitle>
             <CardDescription>
-              Re-run a row with a new volume to exercise the cache
-              scale-down / scale-up path.
+              Re-run any row with a different volume to scale a dataset up
+              or down.
             </CardDescription>
           </CardHeader>
           <CardContent className="px-0">

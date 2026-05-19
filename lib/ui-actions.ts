@@ -3,6 +3,11 @@
 import { redirect } from "next/navigation";
 import { resumeHook, start } from "workflow/api";
 
+import {
+  parseSchema,
+  SchemaParseError,
+  UnsupportedConstructError,
+} from "@/lib/parser";
 import { runWorkflow } from "@/workflows/run";
 import {
   ensureRunRecord,
@@ -78,6 +83,56 @@ export async function submitRunAction(
     requestedVolume: volume,
   });
   redirect(`/runs/${wfRun.runId}`);
+}
+
+export type ValidateSchemaResult =
+  | { ok: true; tables: number }
+  | { ok: false; error: string };
+
+/**
+ * Frontend pre-flight check for the schema textarea. Reuses the real
+ * parser (and the same byte/table caps as submitRunAction) so any
+ * "Valid" verdict here will also be accepted by the pipeline. Pure
+ * read-only; safe to call on every keystroke (debounced).
+ */
+export async function validateSchemaAction(
+  schema: string,
+): Promise<ValidateSchemaResult> {
+  const trimmed = schema.trim();
+  if (trimmed.length === 0) {
+    return { ok: false, error: "Schema is empty." };
+  }
+  const bytes = new TextEncoder().encode(trimmed).byteLength;
+  if (bytes > HARD_CAPS.maxSchemaBytes) {
+    return {
+      ok: false,
+      error: `Over byte cap (${bytes.toLocaleString()} / ${HARD_CAPS.maxSchemaBytes.toLocaleString()}).`,
+    };
+  }
+  try {
+    const model = parseSchema(trimmed);
+    if (model.tables.length === 0) {
+      return { ok: false, error: "No CREATE TABLE statements found." };
+    }
+    if (model.tables.length > HARD_CAPS.maxTables) {
+      return {
+        ok: false,
+        error: `${model.tables.length} tables (cap is ${HARD_CAPS.maxTables}).`,
+      };
+    }
+    return { ok: true, tables: model.tables.length };
+  } catch (err) {
+    if (err instanceof UnsupportedConstructError) {
+      return { ok: false, error: `Unsupported: ${err.construct}.` };
+    }
+    if (err instanceof SchemaParseError) {
+      return { ok: false, error: err.message.replace(/^Failed to parse DDL: /, "") };
+    }
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : "Unknown parse error.",
+    };
+  }
 }
 
 export async function confirmRunAction(runId: string): Promise<void> {
