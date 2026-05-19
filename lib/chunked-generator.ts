@@ -110,6 +110,7 @@ export async function chunkedGenerate(
   const allocations = input.externalAllocations
     ? normalizeExternalAllocations(input.externalAllocations, tableNames)
     : allocateRows(entityModel, plan, volume);
+  clampSingleColumnFkChildren(entityModel, allocations);
   const waves = input.externalParallelGroups
     ? normalizeWaves(input.externalParallelGroups, tableNames)
     : [tableNames];
@@ -231,6 +232,55 @@ function normalizeExternalAllocations(
         : MIN_PER_TABLE;
   }
   return out;
+}
+
+/**
+ * Cap row counts for tables that have any single-column UNIQUE (PK or
+ * otherwise) which is ALSO a foreign key to another table. The
+ * column's values must come from the parent's pool AND be unique
+ * within the child — so the child can never have more rows than the
+ * parent has values for that column. The 1-to-1 augmentation pattern
+ * (e.g. `inventory.product_id` BIGINT PRIMARY KEY REFERENCES
+ * products(id)) is the canonical case.
+ *
+ * The architect doesn't reason about this cross-table cardinality
+ * and will sometimes over-allocate (asked for 500 total → gave
+ * inventory 53 while products got 50). Without clamping, the excess
+ * child rows reach generation with no FK pool value left that
+ * satisfies uniqueness, and the repair agent has no tool to delete
+ * rows — the run finishes "partial" with unresolvable failures.
+ *
+ * The clamp also works deterministically for the integer-PK case
+ * because both parent and child use `allocateKeys` with sequential
+ * `i + 1` — once the child's count ≤ parent's count, the child's
+ * pre-allocated PKs [1..N] are a prefix of the parent's [1..M], so
+ * the FK constraint passes by construction. UUID-PK 1-to-1 tables
+ * would additionally need the child to slice the parent's actual PK
+ * array (since deterministic UUID seeds differ between tables); not
+ * triggered by the demo fixture.
+ */
+function clampSingleColumnFkChildren(
+  model: EntityModel,
+  allocations: Record<string, number>,
+): void {
+  for (const table of model.tables) {
+    let maxParent: number | undefined;
+    for (const col of table.columns) {
+      if (!col.references) continue;
+      if (!col.primaryKey && !col.unique) continue;
+      // Self-references can't cap (the constraint is on the same
+      // pool we're allocating); fall back to the model's normal
+      // generation + repair path for those.
+      if (col.references.table === table.name) continue;
+      const parentCount = allocations[col.references.table] ?? 0;
+      if (maxParent === undefined || parentCount < maxParent) {
+        maxParent = parentCount;
+      }
+    }
+    if (maxParent !== undefined && (allocations[table.name] ?? 0) > maxParent) {
+      allocations[table.name] = maxParent;
+    }
+  }
 }
 
 /**

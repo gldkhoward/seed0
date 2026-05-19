@@ -31,11 +31,31 @@ const TERMINAL = new Set<RunDetail["status"]>([
   "cancelled",
 ]);
 
+/**
+ * Stable composite key for a thought. The workflow stream replays
+ * buffered events from index 0 on every fresh subscription, so any
+ * reconnect (Strict-Mode double-mount in dev, network retries) yields
+ * identical events with identical timestamps. We drop the dupes by
+ * key instead of trusting the wire to never repeat.
+ */
+function thoughtKey(t: AgentThought): string {
+  return `${t.at}|${t.agent}|${t.kind}|${t.toolName ?? ""}|${t.message}`;
+}
+
 export function AgentThoughts({ runId, status }: AgentThoughtsProps) {
   const [thoughts, setThoughts] = useState<AgentThought[]>([]);
   const [open, setOpen] = useState(true);
   const containerRef = useRef<HTMLDivElement>(null);
 
+  // Subscribe once per runId. The parent (RunProgress) calls
+  // router.refresh() on every status transition, which re-renders the
+  // server component and passes a new `status` prop down. If we put
+  // `status` in this dep array, every transition tore down our stream
+  // and opened a fresh one — and because the workflow stream replays
+  // buffered history from index 0 to every new subscriber, we'd
+  // re-append all prior thoughts on each flip. The terminal check is
+  // an entry guard only; once subscribed, the stream closes naturally
+  // when the workflow ends.
   useEffect(() => {
     if (TERMINAL.has(status)) return;
     const controller = new AbortController();
@@ -61,7 +81,11 @@ export function AgentThoughts({ runId, status }: AgentThoughtsProps) {
             if (!line) continue;
             try {
               const thought = JSON.parse(line) as AgentThought;
-              setThoughts((prev) => [...prev, thought]);
+              setThoughts((prev) => {
+                const key = thoughtKey(thought);
+                if (prev.some((t) => thoughtKey(t) === key)) return prev;
+                return [...prev, thought];
+              });
             } catch {
               // Malformed line — skip.
             }
@@ -75,7 +99,8 @@ export function AgentThoughts({ runId, status }: AgentThoughtsProps) {
       cancelled = true;
       controller.abort();
     };
-  }, [runId, status]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runId]);
 
   useEffect(() => {
     if (!containerRef.current) return;
