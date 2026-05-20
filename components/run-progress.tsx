@@ -64,10 +64,28 @@ export function RunProgress({ run: initialRun }: RunProgressProps) {
   useEffect(() => {
     if (!isLive) return;
     const controller = new AbortController();
-    consumeRunSnapshots(initialRun.id, controller.signal, (next) => {
-      setRun((prev) => mergeSnapshot(prev, next));
-    });
-    return () => controller.abort();
+    let cancelled = false;
+    // Reconnect the NDJSON stream when it drops (proxy idle timeouts and
+    // transient network errors can close a long-lived run-progress
+    // connection during a slow step). The events route either resumes the
+    // workflow's writable or serves the latest stored snapshot once and
+    // closes, so reopening eventually delivers the terminal snapshot that
+    // unlocks the "View readiness report" button.
+    void (async () => {
+      let backoffMs = 1000;
+      while (!cancelled) {
+        await consumeRunSnapshots(initialRun.id, controller.signal, (next) => {
+          setRun((prev) => mergeSnapshot(prev, next));
+        });
+        if (cancelled) break;
+        await new Promise((r) => setTimeout(r, backoffMs));
+        backoffMs = Math.min(backoffMs * 2, 8000);
+      }
+    })();
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
   }, [initialRun.id, isLive]);
 
   useEffect(() => {
@@ -844,7 +862,6 @@ function CoverageBoostDetails({ details }: { details: Record<string, unknown> })
 
 function GenerateDetails({ details }: { details: Record<string, unknown> }) {
   const chunked = Boolean(details.chunked);
-  const totalRows = Number(details.totalRows ?? 0);
   const requested = Number(details.requestedVolume ?? 0);
   const rowsByTable = (details.rowsByTable ?? {}) as Record<string, number>;
   const allocations = (details.allocations ?? {}) as Record<string, number>;
@@ -854,6 +871,13 @@ function GenerateDetails({ details }: { details: Record<string, unknown> }) {
     | { table: string; row: Record<string, unknown> }
     | null
     | undefined;
+  // The workflow only sets `totalRows` on the final succeeded payload.
+  // While the step is running, derive the headline from live per-table
+  // progress so it ticks alongside the per-table "Done" column.
+  const totalRows =
+    details.totalRows !== undefined
+      ? Number(details.totalRows)
+      : Object.values(tableProgress).reduce((a, b) => a + b, 0);
 
   const tableNames = Array.from(
     new Set([
