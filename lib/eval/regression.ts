@@ -1,17 +1,20 @@
 /**
- * Evaluation regression check (task 5.3).
+ * Evaluation regression check.
  *
- * Runs the pipeline end-to-end against the fixed ecommerce demo fixture
- * and asserts:
- *   1. 100% hard-constraint pass rate
+ * Runs the pipeline end-to-end against a fixture (ecommerce by default,
+ * any other template via `options.fixture`) and asserts:
+ *   1. constraint pass rate at or above the threshold (default 100%)
  *   2. predicate-based scenario coverage at or above the threshold
+ *      (default 100%)
  *
  * Fails loudly otherwise. This is the Track B evaluation: it is never
- * sacrificed even if Section 6 is cut.
+ * sacrificed.
  *
  * Pipeline implementation is injected — the runner depends only on the
- * Pipeline interface in @/lib/types, so the other parallel agents can
- * implement against it without coupling.
+ * Pipeline interface in @/lib/types, so the eval doesn't couple to the
+ * specific generator/repair path. The CLI in scripts/run-eval.ts wraps
+ * this with --fixture and --all flags so any template can be gated by
+ * the same threshold check that gates ecommerce.
  */
 
 import { ECOMMERCE_FIXTURE } from "@/lib/fixtures/ecommerce";
@@ -23,6 +26,27 @@ import type {
   ScenarioPlan,
   ValidationReport,
 } from "@/lib/types";
+
+/**
+ * Minimal fixture shape consumed by the regression. Matches the
+ * destructured form of `TemplateEntry` from lib/fixtures/index.ts —
+ * any template can be evaluated by passing one of these.
+ */
+export type RegressionFixture = {
+  /** Stable slug used to label output and select via --fixture. */
+  slug: string;
+  ddl: string;
+  context: string;
+  plan: ScenarioPlan;
+};
+
+/** Default fixture — the only template currently `available: true`. */
+export const ECOMMERCE_REGRESSION_FIXTURE: RegressionFixture = {
+  slug: "ecommerce",
+  ddl: ECOMMERCE_FIXTURE.ddl,
+  context: ECOMMERCE_FIXTURE.context,
+  plan: ECOMMERCE_FIXTURE.plan,
+};
 
 export type RegressionThresholds = {
   /** Minimum constraint pass rate. Defaults to 1.0 (100%). */
@@ -38,6 +62,8 @@ export const DEFAULT_THRESHOLDS: RegressionThresholds = {
 
 export type RegressionResult = {
   pass: boolean;
+  /** Slug of the fixture that was evaluated. */
+  fixture: string;
   thresholds: RegressionThresholds;
   report: ReadinessReport;
   dataset: CanonicalDataset;
@@ -48,6 +74,8 @@ export type RegressionOptions = {
   thresholds?: Partial<RegressionThresholds>;
   /** Volume to request from the generator. Default 500 (D7). */
   volume?: number;
+  /** Fixture to evaluate. Defaults to ECOMMERCE_REGRESSION_FIXTURE. */
+  fixture?: RegressionFixture;
 };
 
 /**
@@ -59,18 +87,19 @@ export async function runRegression(
   pipeline: Pipeline,
   options: RegressionOptions = {},
 ): Promise<RegressionResult> {
+  const fixture = options.fixture ?? ECOMMERCE_REGRESSION_FIXTURE;
   const thresholds: RegressionThresholds = {
     ...DEFAULT_THRESHOLDS,
     ...options.thresholds,
   };
   const volume = options.volume ?? 500;
 
-  const entityModel = pipeline.parse(ECOMMERCE_FIXTURE.ddl);
-  const plan: ScenarioPlan = ECOMMERCE_FIXTURE.plan;
+  const entityModel = pipeline.parse(fixture.ddl);
+  const plan: ScenarioPlan = fixture.plan;
 
   const dataset = await pipeline.generate({
     entityModel,
-    context: ECOMMERCE_FIXTURE.context,
+    context: fixture.context,
     plan,
     volume,
   });
@@ -106,6 +135,7 @@ export async function runRegression(
 
   return {
     pass: failures.length === 0,
+    fixture: fixture.slug,
     thresholds,
     report,
     dataset,
@@ -132,7 +162,7 @@ export class RegressionFailure extends Error {
   readonly result: RegressionResult;
   constructor(result: RegressionResult) {
     super(
-      `Demo regression failed (${result.failures.length} threshold miss${
+      `Regression failed for "${result.fixture}" (${result.failures.length} threshold miss${
         result.failures.length === 1 ? "" : "es"
       }):\n  - ${result.failures.join("\n  - ")}`,
     );

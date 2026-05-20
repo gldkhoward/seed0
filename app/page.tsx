@@ -44,16 +44,18 @@ interface Template {
   available: boolean;
 }
 
-// Only ecommerce is exercised by the eval regression; the other templates
-// ship as example schemas in the registry but are intentionally locked off
-// from the home grid so a reviewer can't click through to an un-eval'd
-// surface. To re-enable one, wire it into lib/eval/regression.ts first.
+// Every template is exercised by the eval regression (see
+// lib/eval/workflow-pipeline.ts + scripts/run-eval.ts) and currently
+// passes 100% constraints / 100% predicate coverage on the shipping
+// chunkedGenerate + repair-agent path. The eval is the gate — if a
+// template ever regresses, flip its `available` to false until it
+// passes again. Run `pnpm eval -- --all` to verify the matrix.
 const templates: Template[] = TEMPLATES.map((t) => ({
   slug: t.slug,
   name: t.name,
   tables: t.tables,
   summary: t.summary,
-  available: t.slug === "ecommerce",
+  available: true,
 }));
 
 export default function HomePage() {

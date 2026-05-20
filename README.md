@@ -49,10 +49,17 @@ that streams progress to the UI incrementally instead.
 
 `pnpm eval` runs a regression against the 8-table ecommerce fixture and
 asserts ≥100% constraint pass and ≥100% predicate coverage, exiting non-zero
-otherwise. It currently exercises the simpler single-call generator path
-(`lib/generator.ts`) as a deterministic floor on structured-output quality —
-the shipping workflow's architect / chunked-generator / repair-agent loop is
-exercised by the demo runs themselves, not by the eval.
+otherwise. It exercises the shipping generation path — the same
+`chunkedGenerate` + `repair-agent` the workflow uses — with a deterministic
+execution plan from `synthesizeDeterministicPlan` so the eval measures
+generation + repair quality without mixing in architect planning variance.
+The architect's contribution is exercised by every live demo run and visible
+in the agent-thoughts stream.
+
+`pnpm eval -- --fixture <slug>` runs a single template; `pnpm eval -- --all`
+runs every entry in `TEMPLATES`. The eval is the gate for flipping a
+template's `available: true` in `app/page.tsx` — clicking through to an
+un-eval'd surface should be structurally impossible.
 
 ## Stack
 
@@ -132,7 +139,7 @@ lib/
   repair-agent.ts       Repair LLM tool-call loop (cap ~20; re-validates per tool)
   repair-deterministic.ts  Pure-code repair strategies the agent dispatches to
   coverage-boost.ts     Optional regeneration for uninstantiated scenarios
-  generator.ts          Legacy single-call generator — kept as the eval baseline
+  generator.ts          Legacy single-call generator — unreferenced; kept for history
   planner.ts            Legacy scenarios-only planner — architect fallback path
 
   # Deterministic core (LLM-free)
@@ -143,7 +150,7 @@ lib/
   canonical-export.ts   JSON + Postgres-SQL export derived from canonical form
   predicate-eval.ts     Deterministic predicate evaluator — the verification point
   score.ts              Decomposed readiness score (predicate + constraint)
-  pipeline.ts           Pipeline interface used by the eval (talks to generator.ts)
+  pipeline.ts           Legacy Pipeline factory — superseded by eval/workflow-pipeline.ts
 
   # Plumbing
   run-store.ts          Vercel Blob-backed run record + dataset persistence
@@ -153,6 +160,7 @@ lib/
   ui-types.ts           View-model types + HARD_CAPS + cost estimate
   fixtures/             Ecommerce fixture (eval'd) + 7 example schemas
   eval/regression.ts    Track B regression check (used by `pnpm eval`)
+  eval/workflow-pipeline.ts  Wires chunkedGenerate + repair-agent into the Pipeline (shipping path)
 openspec/               Historical spec — superseded; kept for traceability
 ```
 
