@@ -4,7 +4,9 @@
  * Replaces the one-shot planner: instead of just emitting scenarios,
  * this agent decides the FULL execution graph for the run — table
  * allocations, parallel groups, optional steps, and whether to reuse
- * a cached dataset. It runs as an AI SDK tool loop so the cache
+ * a cached dataset. It runs as a scoped AI SDK tool-call loop with a
+ * hard cap of 8 steps (see `stepCountIs(8)` below), invoked exactly
+ * once per run by the workflow's `plan-execution` step. The cache
  * decision is genuinely agentic: the agent calls `findCachedRuns`,
  * inspects candidates, and decides per-call whether to reuse or
  * regenerate based on the product context.

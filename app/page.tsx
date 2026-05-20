@@ -45,10 +45,9 @@ interface Template {
 }
 
 // Every template is exercised by the eval regression (see
-// lib/eval/workflow-pipeline.ts + scripts/run-eval.ts) and currently
-// passes 100% constraints / 100% predicate coverage on the shipping
-// chunkedGenerate + repair-agent path. The eval is the gate — if a
-// template ever regresses, flip its `available` to false until it
+// lib/eval/workflow-pipeline.ts + scripts/run-eval.ts) against the
+// shipping chunkedGenerate + repair-agent path. The eval is the gate —
+// if a template ever regresses, flip its `available` to false until it
 // passes again. Run `pnpm eval -- --all` to verify the matrix.
 const templates: Template[] = TEMPLATES.map((t) => ({
   slug: t.slug,

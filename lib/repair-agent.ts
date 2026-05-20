@@ -2,11 +2,16 @@
  * Agentic repair loop.
  *
  * The validate-repair step gives a Sonnet agent a set of failures and
- * a tool surface for fixing them. The agent chooses strategy per
- * failure: composite-unique on a junction table → call
- * `getUnusedFkPairs` then `replaceRow`; CHECK violation → just
- * `replaceRow` with corrected data; impossible failure → call
- * `deterministicFix` and let the pure-code fallback handle it.
+ * a tool surface for fixing them. Runs as a scoped AI SDK tool-call
+ * loop with a hard cap of ~20-24 steps (`stepCountIs(stepCap)` below),
+ * invoked exactly once per run by the workflow's `validate-repair`
+ * step — only when the deterministic validator has surfaced failures.
+ *
+ * The agent chooses strategy per failure: composite-unique on a
+ * junction table → call `getUnusedFkPairs` then `replaceRow`; CHECK
+ * violation → just `replaceRow` with corrected data; impossible
+ * failure → call `deterministicFix` and let the pure-code fallback
+ * handle it.
  *
  * Tools verify, not the model: replaceRow re-validates the row after
  * mutation, so the agent can't "fix" something by introducing a new

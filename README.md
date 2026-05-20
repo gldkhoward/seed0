@@ -47,19 +47,20 @@ that streams progress to the UI incrementally instead.
 
 ### Evaluation
 
-`pnpm eval` runs a regression against the 8-table ecommerce fixture and
-asserts ≥100% constraint pass and ≥100% predicate coverage, exiting non-zero
-otherwise. It exercises the shipping generation path — the same
-`chunkedGenerate` + `repair-agent` the workflow uses — with a deterministic
-execution plan from `synthesizeDeterministicPlan` so the eval measures
-generation + repair quality without mixing in architect planning variance.
-The architect's contribution is exercised by every live demo run and visible
-in the agent-thoughts stream.
+`pnpm eval` runs the regression by default against the 8-table ecommerce
+fixture and asserts ≥100% constraint pass and ≥100% predicate coverage,
+exiting non-zero otherwise. It exercises the shipping generation path —
+the same `chunkedGenerate` + `repair-agent` the workflow uses — with a
+deterministic execution plan from `synthesizeDeterministicPlan` so the
+eval measures generation + repair quality without mixing in architect
+planning variance. The architect's contribution is exercised by every
+live demo run and visible in the agent-thoughts stream.
 
 `pnpm eval -- --fixture <slug>` runs a single template; `pnpm eval -- --all`
-runs every entry in `TEMPLATES`. The eval is the gate for flipping a
-template's `available: true` in `app/page.tsx` — clicking through to an
-un-eval'd surface should be structurally impossible.
+runs every entry in `TEMPLATES` (8 fixtures, 62 hand-authored predicates
+total) and is the matrix gate for flipping a template's `available: true`
+in `app/page.tsx` — clicking through to an un-eval'd surface should be
+structurally impossible.
 
 ## Stack
 
@@ -107,7 +108,7 @@ written to Blob so the history view is never empty for a fresh deployment.
 | `pnpm start`       | Run the built app                                           |
 | `pnpm lint`        | ESLint (Next config)                                        |
 | `pnpm typecheck`   | `tsc --noEmit`                                              |
-| `pnpm eval`        | Run the demo regression against the live AI Gateway. Asserts 100% constraint pass and 100% predicate coverage on the 8-table ecommerce fixture; exits non-zero otherwise. Track B requirement. |
+| `pnpm eval`        | Run the demo regression against the live AI Gateway. Defaults to the 8-table ecommerce fixture; `-- --all` runs every template (8 fixtures, 62 predicates). Asserts 100% constraint pass and 100% predicate coverage; exits non-zero otherwise. Track B requirement. |
 
 ## Deploying
 
